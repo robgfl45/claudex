@@ -270,6 +270,9 @@ PY
   if [ "$PHASE" = reviewing ]; then
     claudex_sweep_write_runner "$STATE_FILE" "$RESUME_REVIEW_ID" "$GENERATION" "$STORED_TOPIC" "$SNAPSHOT_SHA" || exit 3
   fi
+  # Keep the guard across the slash-command/Stop-hook handoff. The generated
+  # runner removes it only after taking ownership with its live PID lock.
+  trap - EXIT
   echo "Claudex sweep-v2 review resumed."
   echo "Review ID: $RESUME_REVIEW_ID"
   echo "Generation: $GENERATION of $STORED_MAX"

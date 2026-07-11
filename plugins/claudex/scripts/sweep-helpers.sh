@@ -473,6 +473,7 @@ GENERATION_DIR=$(printf '%q' "$generation_dir")
 SNAPSHOT=$(printf '%q' "$snapshot")
 PERSONA_TIMEOUT=$(printf '%q' "$CLAUDEX_SWEEP_PERSONA_TIMEOUT_SECONDS")
 ACTIVE_PGID_FILE=$(printf '%q' "$CLAUDEX_STATE_DIR/$review_id-active-pgid")
+RESUME_GUARD=$(printf '%q' "$CLAUDEX_STATE_DIR/$review_id.lock.resume-guard")
 source "\$CLAUDE_PLUGIN_ROOT/scripts/state-helpers.sh"
 source "\$CLAUDE_PLUGIN_ROOT/scripts/personas.sh"
 source "\$CLAUDE_PLUGIN_ROOT/scripts/sweep-helpers.sh"
@@ -524,7 +525,8 @@ finally:
 raise SystemExit(exit_code)
 PY
 }
-claudex_lock_write "\$CLAUDEX_STATE_DIR/\$REVIEW_ID.lock"
+claudex_lock_write "\$CLAUDEX_STATE_DIR/\$REVIEW_ID.lock" || exit 3
+rmdir "\$RESUME_GUARD" 2>/dev/null || true
 for persona in \$CLAUDEX_SWEEP_PERSONAS; do
   [ "\$(claudex_state_read_field "\$STATE_FILE" phase)" = cancelled ] && break
   findings="\$GENERATION_DIR/\$persona.findings.md"

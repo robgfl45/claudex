@@ -178,13 +178,15 @@ else:
     state_repo_root = str(pathlib.Path.cwd().resolve() / 'other') if outcome == 'sweep_repo_mismatch' else str(pathlib.Path.cwd().resolve())
     state_evidence_hash = '0' * 64 if outcome == 'sweep_evidence_digest_mismatch' else evidence.hexdigest()
     state_path.write_text(f'''mode: {state_mode}\nphase: {phase}\ntopic: "{state_topic}"\nround: {generation}\nmax_rounds: {maximum}\nreview_id: {state_review_id}\nrepo_root: {state_repo_root}\ndecision_signal: {signal}\nengine: sweep-v2\ngeneration: {generation}\nmax_generations: {maximum}\nsnapshot_sha256: {snapshot_hash}\ncoverage_complete: true\nclean: {clean}\nrevision_required: false\nreviewed_live_sha256: {snapshot_hash}\nevidence_sha256: {state_evidence_hash}\nconsolidated_sha256: {hashlib.sha256(consolidated.read_bytes()).hexdigest()}\nconverged_snapshot_sha256: {converged_hash}\n''')
-    if outcome == 'timeout_partial':
+    if outcome in {'timeout_partial', 'timeout_partial_detached'}:
         for persona in personas[1:]:
             (generation_dir / f'{persona}.findings.md').unlink()
             (generation_dir / f'{persona}.result.json').unlink()
         consolidated.unlink()
         state_path.write_text(f'''mode: plan\nphase: reviewing\ntopic: "review the grounded plan"\nround: {generation}\nmax_rounds: {maximum}\nreview_id: {rid}\nrepo_root: {pathlib.Path.cwd().resolve()}\ndecision_signal: none\nengine: sweep-v2\ngeneration: {generation}\nmax_generations: {maximum}\nsnapshot_sha256: {snapshot_hash}\ncoverage_complete: false\nclean: false\nrevision_required: false\nreviewed_live_sha256: {snapshot_hash}\nevidence_sha256:\nconsolidated_sha256:\nconverged_snapshot_sha256:\n''')
-        child = subprocess.Popen(['sleep', '60'])
+        child = subprocess.Popen(['sleep', '60'], start_new_session=(outcome == 'timeout_partial_detached'))
+        if outcome == 'timeout_partial_detached':
+            (state_dir / f'{rid}-active-pgid').write_text(str(child.pid))
         marker = os.environ.get('FAKE_CHILD_PID_FILE')
         if marker: pathlib.Path(marker).write_text(str(child.pid))
         time.sleep(60)
@@ -441,6 +443,19 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         pid = int(marker.read_text())
         probe = subprocess.run(["kill", "-0", str(pid)], capture_output=True)
         self.assertNotEqual(probe.returncode, 0, f"child process {pid} survived timeout")
+
+    def test_timeout_kills_detached_recorded_reviewer_group(self):
+        marker = self.base / "detached-reviewer.pid"
+        completed, result = self.run_adapter(
+            "timeout_partial_detached", timeout="0.5", extra_env={"FAKE_CHILD_PID_FILE": str(marker)}
+        )
+        self.assertEqual(completed.returncode, 124)
+        self.assertEqual(result["outcome"], "timed_out")
+        reviewer_pid = marker.read_text().strip()
+        probe = subprocess.run(["kill", "-0", reviewer_pid], capture_output=True)
+        self.assertNotEqual(probe.returncode, 0, f"detached reviewer group {reviewer_pid} survived timeout")
+        active_marker = Path(result["source_state_file"]).parent / f"{result['review_id']}-active-pgid"
+        self.assertFalse(active_marker.exists())
 
     def test_external_sigterm_kills_child_group_and_emits_one_json_result(self):
         marker = self.base / "signal-child.pid"

@@ -67,6 +67,48 @@ def terminate_process_group(process: subprocess.Popen[bytes], grace_seconds: flo
     process.wait(timeout=grace_seconds)
 
 
+def terminate_recorded_reviewer_group(state_dir: Path, selected_state: Path | None, grace_seconds: float = 5) -> None:
+    """Terminate the detached Codex group recorded by the sweep runner."""
+    if selected_state is None:
+        return
+    review_id = selected_state.stem
+    if not re.fullmatch(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{6}", review_id):
+        return
+    marker = state_dir / f"{review_id}-active-pgid"
+    try:
+        raw = marker.read_text(encoding="utf-8").strip()
+        pgid = int(raw)
+        if pgid <= 1:
+            return
+    except (FileNotFoundError, OSError, ValueError):
+        return
+
+    def group_alive() -> bool:
+        try:
+            os.killpg(pgid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + grace_seconds
+    while group_alive() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if group_alive():
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        if marker.read_text(encoding="utf-8").strip() == raw:
+            marker.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def restore_pending_plan() -> str | None:
     """Best-effort restoration for an externally staged repository PLAN.md."""
     global _PENDING_PLAN_RESTORE
@@ -787,10 +829,12 @@ def main() -> int:
                 if _INTERRUPTED_SIGNAL is not None:
                     externally_interrupted = True
                     terminate_process_group(process)
+                    terminate_recorded_reviewer_group(state_dir, selected_state)
                     break
                 if time.monotonic() - started >= args.timeout:
                     timed_out = True
                     terminate_process_group(process)
+                    terminate_recorded_reviewer_group(state_dir, selected_state)
                     break
                 time.sleep(0.2)
             returncode = process.wait() if process.poll() is None else process.returncode
@@ -802,10 +846,17 @@ def main() -> int:
         if process is not None and process.poll() is None:
             try:
                 terminate_process_group(process)
+                terminate_recorded_reviewer_group(state_dir, selected_state)
             except (OSError, subprocess.SubprocessError):
                 pass
         returncode = process.returncode if process and process.returncode is not None else 125
         (evidence / "adapter-error.txt").write_text(str(exc) + "\n")
+
+    if args.resume_review_id:
+        try:
+            (state_dir / f"{args.resume_review_id}.lock.resume-guard").rmdir()
+        except (FileNotFoundError, OSError):
+            pass
 
     elapsed = round(time.monotonic() - started, 3)
     if runtime_plan.exists():
