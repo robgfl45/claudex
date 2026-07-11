@@ -220,18 +220,31 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         self.assertEqual(len(lines), 1, completed.stdout)
         return completed, json.loads(lines[0])
 
-    def test_source_runbook_uses_standard_timeout_and_resume_first_recovery(self):
-        runbook = (ROOT / "skills" / "project-plan-review" / "references" / "runbook.md").read_text()
-        skill = (ROOT / "skills" / "project-plan-review" / "SKILL.md").read_text()
+    def test_source_runbook_uses_proportional_caps_resume_and_targeted_closure(self):
+        skill_dir = ROOT / "skills" / "project-plan-review"
+        runbook = (skill_dir / "references" / "runbook.md").read_text()
+        skill = (skill_dir / "SKILL.md").read_text()
+        targeted = (skill_dir / "references" / "targeted-closure.md").read_text()
+        resumed = (skill_dir / "references" / "resumed-sweep-terminal-verification.md").read_text()
         adapter_docs = (ROOT / "docs" / "HEADLESS_ADAPTER.md").read_text()
         self.assertIn("TIMEOUT_SECONDS=3600", runbook)
         self.assertIn("BUDGET_USD=10", runbook)
         self.assertIn("--budget-usd 10.00", adapter_docs)
         self.assertIn("TIMEOUT_SECONDS + 300", runbook)
-        self.assertIn("child_timeout_seconds >= 4200", runbook)
-        self.assertIn("--resume-review-id <REVIEW_ID>", runbook)
-        self.assertIn("outer child timeout of at least 4,200 seconds", skill)
-        self.assertIn("resume first", skill.lower())
+        self.assertIn("--resume-review-id <ID>", runbook)
+        self.assertIn("maximum **two generations**", skill)
+        self.assertIn("maximum **three generations**", skill)
+        self.assertIn("Rob's explicit approval", skill)
+        self.assertIn("ROUNDS` is an integer in `1..5`", runbook)
+        self.assertNotIn("0 normally", runbook)
+        self.assertIn("security/privacy/migration/operations-critical", targeted)
+        self.assertIn("five only with Rob's explicit approval", targeted)
+        self.assertNotIn("--rounds 5", skill)
+        self.assertNotIn("--rounds 5", runbook)
+        self.assertIn("accepted_after_targeted_closure", targeted)
+        self.assertIn("adapter_converged: false", targeted)
+        self.assertIn("Do **not** rerun all five personas automatically", targeted)
+        self.assertIn("targeted-closure.md", resumed)
         self.assertIn("subscription-backed", runbook)
 
     def test_sweep_clean_requires_exact_same_snapshot_five_persona_coverage(self):
