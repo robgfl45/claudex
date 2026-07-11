@@ -134,11 +134,14 @@ else:
         findings.write_text(text)
         findings_hash = hashlib.sha256(findings.read_bytes()).hexdigest()
         expected = '0' * 64 if outcome == 'sweep_hash_mismatch' and persona == 'security-data' else snapshot_hash
+        findings_path_value = str(findings) if outcome == 'sweep_absolute_findings_path' else str(findings.relative_to(pathlib.Path.cwd()))
+        if outcome == 'sweep_wrong_findings_path' and persona == 'security-data':
+            findings_path_value = '../outside.findings.md'
         data = {
             'persona_id': persona, 'expected_snapshot_sha256': expected,
             'actual_snapshot_sha256_before': snapshot_hash,
             'actual_snapshot_sha256_after': snapshot_hash, 'codex_exit_code': (1 if outcome == 'sweep_nonzero_sidecar' and persona == 'security-data' else 0),
-            'findings_path': str(findings), 'findings_sha256': findings_hash,
+            'findings_path': findings_path_value, 'findings_sha256': findings_hash,
             'findings_classification': classification,
             'completed_at': '2099-01-01T00:00:00Z',
         }
@@ -172,7 +175,7 @@ else:
     state_topic = 'different requested topic' if outcome == 'sweep_state_topic_mismatch' else 'review the grounded plan'
     state_repo_root = str(pathlib.Path.cwd().resolve() / 'other') if outcome == 'sweep_repo_mismatch' else str(pathlib.Path.cwd().resolve())
     state_evidence_hash = '0' * 64 if outcome == 'sweep_evidence_digest_mismatch' else evidence.hexdigest()
-    state_path.write_text(f'''mode: {state_mode}\nphase: {phase}\ntopic: {state_topic}\nround: {generation}\nmax_rounds: {maximum}\nreview_id: {state_review_id}\nrepo_root: {state_repo_root}\ndecision_signal: {signal}\nengine: sweep-v2\ngeneration: {generation}\nmax_generations: {maximum}\nsnapshot_sha256: {snapshot_hash}\ncoverage_complete: true\nclean: {clean}\nrevision_required: false\nreviewed_live_sha256: {snapshot_hash}\nevidence_sha256: {state_evidence_hash}\nconsolidated_sha256: {hashlib.sha256(consolidated.read_bytes()).hexdigest()}\nconverged_snapshot_sha256: {converged_hash}\n''')
+    state_path.write_text(f'''mode: {state_mode}\nphase: {phase}\ntopic: "{state_topic}"\nround: {generation}\nmax_rounds: {maximum}\nreview_id: {state_review_id}\nrepo_root: {state_repo_root}\ndecision_signal: {signal}\nengine: sweep-v2\ngeneration: {generation}\nmax_generations: {maximum}\nsnapshot_sha256: {snapshot_hash}\ncoverage_complete: true\nclean: {clean}\nrevision_required: false\nreviewed_live_sha256: {snapshot_hash}\nevidence_sha256: {state_evidence_hash}\nconsolidated_sha256: {hashlib.sha256(consolidated.read_bytes()).hexdigest()}\nconverged_snapshot_sha256: {converged_hash}\n''')
 print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01, 'session_id': 'fake-session'}))
 """)
 
@@ -221,6 +224,17 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         copied_generation = Path(result["generation_evidence_dir"])
         for artifact in ["PLAN.md", "manifest.json", "consolidated-findings.md"] + [f"{persona}.{suffix}" for persona in PERSONAS for suffix in ("findings.md", "result.json")]:
             self.assertEqual((source_generation / artifact).read_bytes(), (copied_generation / artifact).read_bytes(), artifact)
+
+    def test_absolute_sidecar_findings_paths_remain_compatible(self):
+        completed, result = self.run_adapter("sweep_absolute_findings_path")
+        self.assertEqual(completed.returncode, 0)
+        self.assertTrue(result["clean"])
+
+    def test_wrong_sidecar_findings_path_cannot_be_clean(self):
+        completed, result = self.run_adapter("sweep_wrong_findings_path")
+        self.assertEqual(completed.returncode, 11)
+        self.assertFalse(result["clean"])
+        self.assertIn("security-data evidence", result["reason"])
 
     def test_generation_five_material_findings_are_max_reached(self):
         completed, result = self.run_adapter("sweep_max", rounds="5")

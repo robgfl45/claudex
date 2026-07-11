@@ -106,6 +106,18 @@ def run_probe(argv: list[str], cwd: Path, env: dict[str, str], timeout: float = 
     return subprocess.run(argv, cwd=cwd, env=env, text=True, capture_output=True, timeout=timeout, check=False)
 
 
+def decode_state_value(key: str, value: str) -> str:
+    parsed = value.strip()
+    if key == "topic" and len(parsed) >= 2 and parsed.startswith('"') and parsed.endswith('"'):
+        try:
+            decoded = json.loads(parsed)
+            if isinstance(decoded, str):
+                return decoded
+        except json.JSONDecodeError:
+            return parsed[1:-1].replace('\\"', '"')
+    return parsed
+
+
 def parse_state(path: Path) -> dict[str, str]:
     result: dict[str, str] = {}
     try:
@@ -114,7 +126,7 @@ def parse_state(path: Path) -> dict[str, str]:
                 continue
             key, value = line.split(":", 1)
             if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
-                result[key] = value.strip()
+                result[key] = decode_state_value(key, value)
     except OSError:
         pass
     return result
@@ -176,7 +188,7 @@ def strict_state(path: Path) -> tuple[dict[str, str], list[str]]:
         elif key in state:
             errors.append(f"state contains duplicate field {key}")
         else:
-            state[key] = value.strip()
+            state[key] = decode_state_value(key, value)
     return state, errors
 
 
@@ -359,14 +371,18 @@ def validate_sweep(state_file: Path, review_dir: Path, source_review_dir: Path, 
                 errors.append(f"{persona} sidecar is unreadable or malformed: {exc}")
             if sidecar_data:
                 required = {"persona_id", "expected_snapshot_sha256", "actual_snapshot_sha256_before", "actual_snapshot_sha256_after", "codex_exit_code", "findings_path", "findings_sha256", "findings_classification", "completed_at"}
-                expected_path = str(source_review_dir / "generations" / str(generation) / findings.name)
+                expected_path = source_review_dir / "generations" / str(generation) / findings.name
+                reported_path_value = sidecar_data.get("findings_path")
+                reported_path = Path(reported_path_value) if isinstance(reported_path_value, str) else None
+                if reported_path is not None and not reported_path.is_absolute():
+                    reported_path = runtime_plan.parent / reported_path
                 valid = set(sidecar_data) == required
                 valid &= sidecar_data.get("persona_id") == persona
                 valid &= sidecar_data.get("expected_snapshot_sha256") == snapshot_hash
                 valid &= sidecar_data.get("actual_snapshot_sha256_before") == snapshot_hash
                 valid &= sidecar_data.get("actual_snapshot_sha256_after") == snapshot_hash
                 valid &= sidecar_data.get("codex_exit_code") == 0
-                valid &= sidecar_data.get("findings_path") == expected_path
+                valid &= reported_path is not None and reported_path.resolve() == expected_path.resolve()
                 valid &= sidecar_data.get("findings_classification") == classification
                 try:
                     valid &= sidecar_data.get("findings_sha256") == sha256_file(findings)
