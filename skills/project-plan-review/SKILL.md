@@ -1,37 +1,51 @@
 ---
 name: project-plan-review
 description: Use for substantial implementation plans that benefit from independent Claude/Claudex/Codex adversarial review. Skip tiny, obvious fixes.
-version: 1.0.0
+version: 2.0.0
 license: MIT
 metadata:
   hermes:
-    tags: [planning, claudex, codex, delegation, verification]
+    tags: [planning, claudex, codex, delegation, verification, sweep-v2]
 ---
 
 # Project Plan Review
 
-Use this workflow for substantial features, migrations, or risky cross-cutting work. **Do not use it for tiny fixes** where the review overhead exceeds the implementation risk.
+Use this workflow for substantial features, migrations, or risky cross-cutting work. **Do not use it for tiny fixes** where review overhead exceeds implementation risk.
 
 ## Main Drake workflow
 
 1. Ground the project first: inspect the repository, current behavior, constraints, tests, and user request. Never ask a leaf reviewer to invent this context.
-2. Draft a concrete `PLAN.md` in the project root. Include scope/non-scope, exact files, contracts that already exist, steps, rollback, and verification.
+2. Draft a concrete `PLAN.md` in the project root. Include scope/non-scope, exact files, existing contracts, steps, rollback, and verification.
 3. Read [the delegation runbook](references/runbook.md).
-4. Call `delegate_task` with a self-contained goal/context that includes absolute paths for the repository, `PLAN.md`, adapter, Claude, Codex, and desired evidence directory; include rounds, timeout, and budget. The child is a leaf: it cannot ask Rob questions or delegate further.
-5. Keep the main Drake session responsive while the child performs the bounded adapter run. Do not transfer user-facing ownership to the child.
-6. On return, verify every returned file exists and read back `result.json`, final `PLAN.md`, state, and final findings. A claimed path is not evidence until read.
-7. Independently reject scope creep, invented contracts, and recommendations unsupported by the grounded repository. Claudex is a critic, not the product owner.
-8. Normalize the plan so only the active implementation phase remains; remove completed prerequisites, historical phases, and stale branching instructions.
-9. Attach or return the final reviewed `PLAN.md`, outcome, unresolved findings, and evidence paths. Only `converged` is clean.
+4. Use the adapter's default `sweep-v2` engine with `--rounds 5`. The command must invoke `/claudex:plan --engine sweep-v2 --from-draft --skip-interview --rounds 5 ...` through the adapter.
+5. Call `delegate_task` with self-contained context and absolute paths for the repository, `PLAN.md`, adapter, plugin, Claude, Codex, and evidence directory. The child is a leaf: it cannot ask Rob questions or delegate further.
+6. Keep the main Drake session responsive while the child performs the bounded run. The outer child timeout must reserve at least 180 seconds beyond the adapter timeout for artifact read-back and reporting.
+7. On return, read `result.json`, the copied `evidence_state_file`, generation manifest, consolidated findings, and all five persona sidecars/findings from adapter evidence. A claimed path is not evidence until read.
+8. Independently reject scope creep, invented contracts, and recommendations unsupported by the grounded repository. Claudex is a critic, not the product owner.
+9. Normalize the plan so only the active implementation phase remains; remove completed prerequisites, historical phases, and stale branching instructions.
+10. **If Drake's normalization materially changes requirements, sequencing, contracts, safety controls, or verification, run sweep-v2 again.** A prior convergence hash does not cover a materially changed plan.
+11. Attach or return the final reviewed `PLAN.md`, outcome, snapshot/converged hashes, persona coverage, unresolved findings, and copied evidence paths. Only `converged` is clean.
+
+## Sweep-v2 convergence contract
+
+A clean result requires all of the following from authoritative state and artifacts, never Claude prose:
+
+- terminal `phase=done`, `decision_signal=converged`, `clean=true`, and `coverage_complete=true`;
+- exactly the five required personas—architecture/scope, security/data, product/domain, quality/accessibility/performance, and operations/deployment;
+- every persona result tied to the same immutable generation snapshot SHA-256, with readable, schema-valid sidecars and findings;
+- a readable generation manifest and consolidated findings whose hashes match state; and
+- consolidated findings proving that all five personas returned exactly no substantive findings.
+
+Generation five with material findings is `max_reached` and non-clean. Missing, malformed, mutated, hash-mismatched, nonzero, cancelled, degraded, or incomplete evidence is never clean.
 
 ## Boundaries and outcome rules
 
 - The adapter may write only `PLAN.md` plus `.claude/claudex/` evidence/state in the target repository. It must not implement the plan, commit, push, merge, or change global Hermes/Claude configuration.
 - Use a disposable worktree/repository when the plan or project cannot safely be modified in place.
 - `max_reached` proves mechanics, not plan approval. `degraded`, `failed`, and `timed_out` are also non-clean.
-- Findings artifacts and Claudex state override Claude prose. Main Drake still independently validates all accepted recommendations.
+- Claude and Codex are subscription-backed in this workflow. Dollar-valued budget/cost fields are CLI usage telemetry and a bounded-run control, not evidence of direct API billing or an invoice. Codex subscription usage is not dollar-enforced by the adapter.
 - Never expose secrets in the topic, plan, delegated prompt, or evidence.
 
 ## Verification gate
 
-Before attaching the final plan, require: readable `result.json`; matching absolute repo/plan paths; a terminal state; readable final findings; `clean=true` only with `outcome=converged`; and a final plan whose proposed contracts map to repository evidence or explicit user requirements.
+Before attaching the final plan, require readable copied evidence paths; matching absolute repo/plan paths; accurate `engine`, `generation`, and `max_generations`; terminal state; exact five-persona same-hash coverage; readable manifest and consolidated findings; `clean=true` only with `outcome=converged`; and a final plan whose contracts map to repository evidence or explicit user requirements. Re-review any later material plan change.

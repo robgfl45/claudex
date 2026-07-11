@@ -235,13 +235,13 @@ The Stop hook is fail-open everywhere. Any error returns `{"decision":"approve"}
 
 ## Headless Hermes planning bridge
 
-This fork adds [`bin/claudex-plan-review`](docs/HEADLESS_ADAPTER.md), a production-oriented adapter for running an existing `PLAN.md` through headless Claude Code, the Claudex Stop-hook lifecycle, and real Codex reviews from a Hermes leaf subagent. It validates explicit executable/plugin/auth prerequisites, pins child `PATH`, enforces wall-clock and Claude budget bounds, kills the complete process group on timeout, preserves evidence, and emits one strict JSON result.
+This fork adds [`bin/claudex-plan-review`](docs/HEADLESS_ADAPTER.md), a production-oriented adapter for running an existing `PLAN.md` through headless Claude Code and Claudex. Its default `sweep-v2` path runs the Phase 1 frozen-snapshot, five-persona lifecycle with a generation cap of `1..5` (the staged Hermes workflow uses five); `--engine legacy` preserves backward compatibility. It validates explicit executable/plugin/auth prerequisites, pins child `PATH`, enforces wall-clock and Claude telemetry-budget bounds, kills the complete process group on timeout, copies complete state/generation evidence, and emits one strict JSON result.
 
-Only `converged` is clean. `max_reached`, `degraded`, `failed`, and `timed_out` are explicit non-clean outcomes. Classification is based on Claudex state and findings artifacts, never Claude's prose tally. See the adapter document for exact usage, exit codes, costs, architecture, and staging instructions. The in-repo Hermes skill is staged at [`skills/project-plan-review/`](skills/project-plan-review/SKILL.md); it is not installed automatically.
+Only `converged` is clean. `max_reached`, `degraded`, `failed`, and `timed_out` are explicit non-clean outcomes. Sweep classification requires terminal authoritative state plus exact same-snapshot five-persona coverage, valid manifests/hashes, and consolidated findings proving clean; Claude prose or one final findings file is insufficient. See the adapter document for usage, exit codes, subscription telemetry wording, architecture, and staging instructions. The in-repo Hermes skill is staged at [`skills/project-plan-review/`](skills/project-plan-review/SKILL.md); it is not installed automatically.
 
-## Cost expectation
+## Subscription usage expectation
 
-Each plan-mode round is one full Codex review of `PLAN.md`. In practice that's ~25–30k Codex tokens per round. With the default 3 rounds you should expect **~75–90k tokens per `/claudex:plan`**. Codex authenticates against your ChatGPT account, so the bill goes to your ChatGPT Plus / Pro / Team / Enterprise plan, not to claudex. If you're on a tight rate limit, run `--rounds 2` for fast topics and reserve `--rounds 5+` for high-stakes designs.
+Legacy plan mode invokes one Codex review per round. Sweep-v2 can invoke all five required Codex personas in each generation, up to its hard cap of five generations. Claude Code and Codex authenticate through subscription-backed CLIs in this workflow; any dollar-valued fields are usage-equivalent telemetry/bounded-run controls, not direct API billing or an invoice. Both services may still enforce subscription rate limits.
 
 ## Safety
 
