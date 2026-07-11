@@ -304,10 +304,16 @@ When the runner finishes, end your turn."
     summarizing)
       # Revalidate every current-generation artifact at summary time so a
       # post-run mutation cannot ride a previously clean state signal. Clear
-      # the prior verdict first so an I/O/consolidation failure fails closed.
-      if ! claudex_state_set_field "$ACTIVE_STATE" decision_signal degraded \
-        || ! claudex_state_set_field "$ACTIVE_STATE" clean false \
-        || ! claudex_state_set_field "$ACTIVE_STATE" coverage_complete false; then
+      # the prior verdict first so an I/O/consolidation failure fails closed,
+      # but never overwrite a cancellation that won the state-write race.
+      if [ "$(claudex_state_read_field "$ACTIVE_STATE" phase)" = cancelled ]; then
+        approve "sweep-v2 cancelled before terminal revalidation"
+      fi
+      if ! claudex_sweep_set_fields_atomic "$ACTIVE_STATE" --expect-phase summarizing \
+        decision_signal degraded clean false coverage_complete false; then
+        if [ "$(claudex_state_read_field "$ACTIVE_STATE" phase)" = cancelled ]; then
+          approve "sweep-v2 cancelled before fail-closed revalidation"
+        fi
         block "Sweep-v2 could not persist its fail-closed revalidation state. No clean result is claimed; repair the state directory and retry or cancel."
       fi
       if claudex_sweep_consolidate "$ACTIVE_STATE" "$REVIEW_ID" "$GENERATION" "$SNAPSHOT_SHA" "$SNAPSHOT_SHA" >/dev/null 2>&1; then
@@ -321,10 +327,11 @@ When the runner finishes, end your turn."
       case "$REVALIDATE_RC" in
         0|2|3) ;;
         *)
-          if ! claudex_state_set_field "$ACTIVE_STATE" decision_signal degraded \
-            || ! claudex_state_set_field "$ACTIVE_STATE" clean false \
-            || ! claudex_state_set_field "$ACTIVE_STATE" coverage_complete false \
-            || ! claudex_state_set_field "$ACTIVE_STATE" phase summarizing; then
+          if ! claudex_sweep_set_fields_atomic "$ACTIVE_STATE" --expect-phase summarizing \
+            decision_signal degraded clean false coverage_complete false phase summarizing; then
+            if [ "$(claudex_state_read_field "$ACTIVE_STATE" phase)" = cancelled ]; then
+              approve "sweep-v2 cancelled while persisting degraded revalidation"
+            fi
             block "Sweep-v2 revalidation failed and its degraded verdict could not be persisted. No clean result is claimed."
           fi
           ;;
@@ -333,15 +340,24 @@ When the runner finishes, end your turn."
       CLEAN=$(claudex_state_read_field "$ACTIVE_STATE" clean)
       COVERAGE_COMPLETE=$(claudex_state_read_field "$ACTIVE_STATE" coverage_complete)
       if [ "$SIGNAL" = "converged" ] && { [ "$REVALIDATE_RC" -ne 0 ] || [ "$CLEAN" != "true" ] || [ "$COVERAGE_COMPLETE" != "true" ]; }; then
-        claudex_state_set_field "$ACTIVE_STATE" decision_signal degraded
-        claudex_state_set_field "$ACTIVE_STATE" clean false
-        claudex_state_set_field "$ACTIVE_STATE" coverage_complete false
+        if ! claudex_sweep_set_fields_atomic "$ACTIVE_STATE" --expect-phase summarizing \
+          decision_signal degraded clean false coverage_complete false; then
+          if [ "$(claudex_state_read_field "$ACTIVE_STATE" phase)" = cancelled ]; then
+            approve "sweep-v2 cancelled while correcting inconsistent convergence"
+          fi
+          block "Sweep-v2 could not persist an inconsistent-convergence correction. No clean result is claimed."
+        fi
         SIGNAL=degraded
         CLEAN=false
         COVERAGE_COMPLETE=false
       fi
       CONVERGED_SHA=$(claudex_state_read_field "$ACTIVE_STATE" converged_snapshot_sha256)
-      claudex_state_set_field "$ACTIVE_STATE" phase done
+      if ! claudex_sweep_set_fields_atomic "$ACTIVE_STATE" --expect-phase summarizing phase done; then
+        if [ "$(claudex_state_read_field "$ACTIVE_STATE" phase)" = cancelled ]; then
+          approve "sweep-v2 cancelled before terminal summary commit"
+        fi
+        block "Sweep-v2 could not commit its terminal summary state. No result is claimed."
+      fi
       rm -f "$RUNNER" "$STATE_DIR/$REVIEW_ID-prompt.txt" "$STATE_DIR/$REVIEW_ID.lock" "$STATE_DIR/$REVIEW_ID-active-pgid" 2>/dev/null
       case "$SIGNAL" in
         converged)

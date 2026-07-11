@@ -297,6 +297,12 @@ check "cancelled phase wins a racing stale verdict CAS" bash -c "[ '$STALE_VERDI
 
 new_repo; start_sweep
 bash "$RUNNER" >/dev/null 2>&1
+bash "$CANCEL" >/dev/null 2>&1
+echo '{}' | bash "$HOOK" >/dev/null 2>&1
+check "terminal revalidation preserves an already-cancelled verdict" bash -c "[ \"\$(sed -n 's/^phase: *//p' '$STATE')\" = cancelled ] && [ \"\$(sed -n 's/^decision_signal: *//p' '$STATE')\" = cancelled ] && [ \"\$(sed -n 's/^clean: *//p' '$STATE')\" = false ]"
+
+new_repo; start_sweep
+bash "$RUNNER" >/dev/null 2>&1
 GEN_DIR=".claude/claudex/$ID/generations/1"
 chmod a-w "$GEN_DIR"
 echo '{}' | bash "$HOOK" >/dev/null 2>&1
