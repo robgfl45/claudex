@@ -283,7 +283,7 @@ while [ ! -s "$ACTIVE_PGID_FILE" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)
 CANCELLED_PGID=$(cat "$ACTIVE_PGID_FILE" 2>/dev/null)
 bash "$CANCEL" >/dev/null 2>&1
 wait "$RUNNER_TEST_PID" 2>/dev/null
-check "cancel preserves terminal cancelled state" test "$(field "$STATE" phase)" = cancelled
+check "cancel preserves terminal cancelled state" bash -c "[ \"\$(sed -n 's/^phase: *//p' '$STATE')\" = cancelled ] && [ \"\$(sed -n 's/^decision_signal: *//p' '$STATE')\" = cancelled ] && [ \"\$(sed -n 's/^clean: *//p' '$STATE')\" = false ] && [ \"\$(sed -n 's/^coverage_complete: *//p' '$STATE')\" = false ]"
 check "cancel terminates the active reviewer process group" bash -c "[ -n '$CANCELLED_PGID' ] && ! kill -0 -- '-$CANCELLED_PGID' 2>/dev/null"
 check "cancel removes active process metadata" test ! -e "$ACTIVE_PGID_FILE"
 unset CLAUDEX_SWEEP_PERSONA_TIMEOUT_SECONDS CLAUDEX_SWEEP_STUB_MODE CLAUDEX_SWEEP_STUB_PERSONA
@@ -299,7 +299,7 @@ new_repo; start_sweep
 bash "$RUNNER" >/dev/null 2>&1
 bash "$CANCEL" >/dev/null 2>&1
 echo '{}' | bash "$HOOK" >/dev/null 2>&1
-check "terminal revalidation preserves an already-cancelled verdict" bash -c "[ \"\$(sed -n 's/^phase: *//p' '$STATE')\" = cancelled ] && [ \"\$(sed -n 's/^decision_signal: *//p' '$STATE')\" = cancelled ] && [ \"\$(sed -n 's/^clean: *//p' '$STATE')\" = false ]"
+check "terminal revalidation preserves an already-cancelled verdict" bash -c "[ \"\$(sed -n 's/^phase: *//p' '$STATE')\" = cancelled ] && [ \"\$(sed -n 's/^decision_signal: *//p' '$STATE')\" = cancelled ] && [ \"\$(sed -n 's/^clean: *//p' '$STATE')\" = false ] && [ \"\$(sed -n 's/^coverage_complete: *//p' '$STATE')\" = false ]"
 
 new_repo; start_sweep
 bash "$RUNNER" >/dev/null 2>&1

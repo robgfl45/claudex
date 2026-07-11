@@ -23,7 +23,7 @@ if [ "$ENGINE" = "sweep-v2" ]; then
   # shellcheck source=/dev/null
   source "$CLAUDE_PLUGIN_ROOT/scripts/sweep-helpers.sh"
   claudex_sweep_set_fields_atomic "$ACTIVE" \
-    phase cancelled decision_signal cancelled clean false revision_required false || {
+    phase cancelled decision_signal cancelled clean false coverage_complete false revision_required false || {
       echo "Could not persist cancellation." >&2
       exit 1
     }
