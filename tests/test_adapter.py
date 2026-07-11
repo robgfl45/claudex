@@ -176,6 +176,16 @@ else:
     state_repo_root = str(pathlib.Path.cwd().resolve() / 'other') if outcome == 'sweep_repo_mismatch' else str(pathlib.Path.cwd().resolve())
     state_evidence_hash = '0' * 64 if outcome == 'sweep_evidence_digest_mismatch' else evidence.hexdigest()
     state_path.write_text(f'''mode: {state_mode}\nphase: {phase}\ntopic: "{state_topic}"\nround: {generation}\nmax_rounds: {maximum}\nreview_id: {state_review_id}\nrepo_root: {state_repo_root}\ndecision_signal: {signal}\nengine: sweep-v2\ngeneration: {generation}\nmax_generations: {maximum}\nsnapshot_sha256: {snapshot_hash}\ncoverage_complete: true\nclean: {clean}\nrevision_required: false\nreviewed_live_sha256: {snapshot_hash}\nevidence_sha256: {state_evidence_hash}\nconsolidated_sha256: {hashlib.sha256(consolidated.read_bytes()).hexdigest()}\nconverged_snapshot_sha256: {converged_hash}\n''')
+    if outcome == 'timeout_partial':
+        for persona in personas[1:]:
+            (generation_dir / f'{persona}.findings.md').unlink()
+            (generation_dir / f'{persona}.result.json').unlink()
+        consolidated.unlink()
+        state_path.write_text(f'''mode: plan\nphase: reviewing\ntopic: "review the grounded plan"\nround: {generation}\nmax_rounds: {maximum}\nreview_id: {rid}\nrepo_root: {pathlib.Path.cwd().resolve()}\ndecision_signal: none\nengine: sweep-v2\ngeneration: {generation}\nmax_generations: {maximum}\nsnapshot_sha256: {snapshot_hash}\ncoverage_complete: false\nclean: false\nrevision_required: false\nreviewed_live_sha256: {snapshot_hash}\nevidence_sha256:\nconsolidated_sha256:\nconverged_snapshot_sha256:\n''')
+        child = subprocess.Popen(['sleep', '60'])
+        marker = os.environ.get('FAKE_CHILD_PID_FILE')
+        if marker: pathlib.Path(marker).write_text(str(child.pid))
+        time.sleep(60)
 print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01, 'session_id': 'fake-session'}))
 """)
 
@@ -186,7 +196,7 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         path.write_text(textwrap.dedent(content))
         path.chmod(0o755)
 
-    def run_adapter(self, outcome="sweep_clean", timeout="5", extra_env=None, engine="sweep-v2", rounds="1", plan=None):
+    def run_adapter(self, outcome="sweep_clean", timeout="5", extra_env=None, engine="sweep-v2", rounds="1", plan=None, resume_id=None, topic="review the grounded plan"):
         env = os.environ.copy()
         env["FAKE_CLAUDE_OUTCOME"] = outcome
         if extra_env:
@@ -194,15 +204,27 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         plan_path = Path(plan) if plan is not None else self.plan
         command = [
             str(ADAPTER), "--repo", str(self.repo.resolve()), "--plan", str(plan_path.resolve()),
-            "--topic", "review the grounded plan", "--rounds", rounds, "--timeout", timeout,
+            "--topic", topic, "--rounds", rounds, "--timeout", timeout,
             "--budget-usd", "1.25", "--plugin-root", str(PLUGIN.resolve()),
             "--claude", str(self.claude.resolve()), "--codex", str(self.codex.resolve()),
             "--engine", engine,
         ]
+        if resume_id is not None:
+            command.extend(["--resume-review-id", resume_id])
         completed = subprocess.run(command, text=True, capture_output=True, env=env, timeout=10)
         lines = completed.stdout.splitlines()
         self.assertEqual(len(lines), 1, completed.stdout)
         return completed, json.loads(lines[0])
+
+    def test_source_runbook_uses_standard_timeout_and_resume_first_recovery(self):
+        runbook = (ROOT / "skills" / "project-plan-review" / "references" / "runbook.md").read_text()
+        skill = (ROOT / "skills" / "project-plan-review" / "SKILL.md").read_text()
+        self.assertIn("TIMEOUT_SECONDS=3600", runbook)
+        self.assertIn("child_timeout_seconds >= 4200", runbook)
+        self.assertIn("--resume-review-id <REVIEW_ID>", runbook)
+        self.assertIn("outer child timeout of at least 4,200 seconds", skill)
+        self.assertIn("resume first", skill.lower())
+        self.assertIn("subscription-backed", runbook)
 
     def test_sweep_clean_requires_exact_same_snapshot_five_persona_coverage(self):
         marker = self.base / "prompt.txt"
@@ -355,6 +377,58 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         self.assertEqual(result["outcome"], "failed")
         self.assertFalse(result["clean"])
 
+    def create_interrupted_sweep(self):
+        completed, result = self.run_adapter("timeout_partial", timeout="0.5")
+        self.assertEqual(completed.returncode, 124)
+        return result
+
+    def test_resume_identity_mismatches_are_rejected_before_provider_launch(self):
+        interrupted = self.create_interrupted_sweep()
+        marker = self.base / "resume-provider-prompt"
+        cases = (
+            {"resume_id": interrupted["review_id"], "topic": "different topic"},
+            {"resume_id": interrupted["review_id"], "rounds": "2"},
+            {"resume_id": "20990101-000000-deadbe"},
+        )
+        for index, kwargs in enumerate(cases):
+            with self.subTest(index=index):
+                marker.unlink(missing_ok=True)
+                completed, result = self.run_adapter(extra_env={"FAKE_PROMPT_FILE": str(marker)}, **kwargs)
+                self.assertEqual(completed.returncode, 12)
+                self.assertEqual(result["error"]["kind"], "resume_validation")
+                self.assertFalse(marker.exists())
+
+    def test_resume_rejects_noncanonical_plan_and_terminal_state_before_provider(self):
+        interrupted = self.create_interrupted_sweep()
+        marker = self.base / "resume-provider-prompt"
+        external = self.base / "external.md"
+        external.write_text(self.plan.read_text())
+        completed, result = self.run_adapter(plan=external, resume_id=interrupted["review_id"], extra_env={"FAKE_PROMPT_FILE": str(marker)})
+        self.assertEqual(result["error"]["kind"], "resume_validation")
+        self.assertFalse(marker.exists())
+        state = Path(interrupted["source_state_file"])
+        state.write_text(state.read_text().replace("phase: reviewing", "phase: cancelled"))
+        completed, result = self.run_adapter(resume_id=interrupted["review_id"], extra_env={"FAKE_PROMPT_FILE": str(marker)})
+        self.assertEqual(result["error"]["kind"], "resume_validation")
+        self.assertFalse(marker.exists())
+
+    def test_resume_rejects_active_lock_but_accepts_stale_inode(self):
+        interrupted = self.create_interrupted_sweep()
+        review_id = interrupted["review_id"]
+        state_dir = self.repo / ".claude" / "claudex"
+        marker = self.base / "resume-provider-prompt"
+        lock = state_dir / f"{review_id}.lock"
+        lock.write_text(f"{os.getpid()}\n")
+        completed, result = self.run_adapter(resume_id=review_id, extra_env={"FAKE_PROMPT_FILE": str(marker)})
+        self.assertEqual(result["error"]["kind"], "resume_validation")
+        self.assertFalse(marker.exists())
+        lock.write_text("999999\n")
+        completed, result = self.run_adapter("failed", resume_id=review_id, extra_env={"FAKE_PROMPT_FILE": str(marker)})
+        self.assertEqual(completed.returncode, 12)
+        self.assertEqual(result["outcome"], "failed")
+        self.assertTrue(marker.is_file())
+        self.assertIn(f"--resume-review-id {review_id}", marker.read_text())
+
     def test_timeout_kills_and_reaps_process_group(self):
         marker = self.base / "child.pid"
         completed, result = self.run_adapter("timeout", timeout="0.5", extra_env={"FAKE_CHILD_PID_FILE": str(marker)})
@@ -363,6 +437,26 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         pid = int(marker.read_text())
         probe = subprocess.run(["kill", "-0", str(pid)], capture_output=True)
         self.assertNotEqual(probe.returncode, 0, f"child process {pid} survived timeout")
+
+    def test_timeout_reports_validated_partial_sweep_progress_and_copies_evidence(self):
+        marker = self.base / "partial-child.pid"
+        completed, result = self.run_adapter("timeout_partial", timeout="0.5", extra_env={"FAKE_CHILD_PID_FILE": str(marker)})
+        self.assertEqual(completed.returncode, 124)
+        self.assertEqual(result["outcome"], "timed_out")
+        self.assertFalse(result["clean"])
+        self.assertEqual((result["generation"], result["max_generations"]), (1, 1))
+        self.assertEqual(result["phase"], "reviewing")
+        self.assertEqual(result["snapshot_sha256"], result["persona_coverage"][0]["snapshot_sha256"])
+        self.assertTrue(result["persona_coverage"][0]["valid"])
+        self.assertFalse(any(item["valid"] for item in result["persona_coverage"][1:]))
+        self.assertTrue(Path(result["generation_manifest"]).is_file())
+        self.assertTrue(Path(result["generation_evidence_dir"]).is_dir())
+        self.assertIsNone(result["consolidated_findings"])
+        source = self.repo / ".claude" / "claudex" / result["review_id"] / "generations" / "1" / "architecture-scope.result.json"
+        copied = Path(result["generation_evidence_dir"]) / source.name
+        self.assertEqual(source.read_bytes(), copied.read_bytes())
+        probe = subprocess.run(["kill", "-0", marker.read_text().strip()], capture_output=True)
+        self.assertNotEqual(probe.returncode, 0)
 
     def test_external_plan_is_staged_and_repository_plan_is_restored(self):
         original_repo_plan = "# Repository plan\n\nKeep this intact.\n"

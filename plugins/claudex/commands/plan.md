@@ -1,6 +1,6 @@
 ---
 description: Run an autonomous plan-and-review loop. Claude drafts PLAN.md, Codex grills it adversarially, Claude revises until LGTM or N rounds.
-argument-hint: '[--engine sweep-v2] [--rounds N] [--from-draft] [--skip-interview] <feature description>'
+argument-hint: '[--engine sweep-v2] [--rounds N] [--from-draft | --resume-review-id ID] [--skip-interview] <feature description>'
 allowed-tools: Bash, Read, Write, Edit, AskUserQuestion
 ---
 
@@ -18,6 +18,7 @@ Parse these flags from the start of $ARGUMENTS (the script handles them; you mai
 - `--from-draft`. Use the existing `PLAN.md` in the project root instead of drafting from scratch. PLAN.md must exist and be non-empty.
 - `--skip-interview`. Bypass the topic-sharpening interview offer in step 2 below. Useful when you've already nailed the topic or you're in a rush.
 - `--engine sweep-v2`. Opt into the Phase 1 frozen-snapshot engine. It requires an existing non-empty `PLAN.md`, runs all five required personas sequentially per generation, defaults to five generations, and never permits more than five. Omit this flag for unchanged legacy plan mode.
+- `--resume-review-id ID`. Resume one interrupted sweep-v2 review with exact repository/topic/path/cap binding. Valid completed same-generation persona evidence is reused; invalid evidence degrades and is never replaced.
 
 ## Procedure
 
@@ -75,7 +76,7 @@ Run start-loop.sh. **CRITICAL: the topic MUST be passed as a single double-quote
 
 Compose the bash command this way:
 
-1. Identify any flags from `$ARGUMENTS`: `--engine sweep-v2`, `--rounds N`, `--from-draft`. (`--skip-interview` was already consumed in step 2.)
+1. Identify any flags from `$ARGUMENTS`: `--engine sweep-v2`, `--rounds N`, `--from-draft`, `--resume-review-id ID`. (`--skip-interview` was already consumed in step 2.)
 2. Identify the topic: everything that isn't a recognized flag.
 3. Pass flags as-is (no quoting needed). Pass the topic as ONE double-quoted argument.
 

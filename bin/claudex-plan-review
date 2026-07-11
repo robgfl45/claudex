@@ -36,6 +36,7 @@ SWEEP_PERSONAS = [
 ]
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _PENDING_PLAN_RESTORE: tuple[Path, Path, bool] | None = None
+_PENDING_ADAPTER_LOCK: Path | None = None
 
 
 def restore_pending_plan() -> str | None:
@@ -54,6 +55,100 @@ def restore_pending_plan() -> str | None:
         return str(exc)
     _PENDING_PLAN_RESTORE = None
     return None
+
+
+def release_adapter_lock() -> None:
+    global _PENDING_ADAPTER_LOCK
+    if _PENDING_ADAPTER_LOCK is not None:
+        try:
+            if _PENDING_ADAPTER_LOCK.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                _PENDING_ADAPTER_LOCK.unlink(missing_ok=True)
+        except OSError:
+            pass
+        _PENDING_ADAPTER_LOCK = None
+
+
+def pid_alive(raw: str) -> bool:
+    try:
+        os.kill(int(raw.strip()), 0)
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def validate_resume_identity(repo: Path, plan: Path, state_dir: Path, review_id: str, topic: str, maximum: int) -> tuple[Path, Path]:
+    if not re.fullmatch(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{6}", review_id):
+        raise ValueError("--resume-review-id has an invalid format")
+    state_file = state_dir / f"{review_id}.state"
+    review_dir = state_dir / review_id
+    if not state_file.is_file() or not review_dir.is_dir():
+        raise ValueError("resume review state/evidence does not exist")
+    state, errors = strict_state(state_file)
+    expected = {"review_id": review_id, "mode": "plan", "engine": "sweep-v2", "repo_root": str(repo), "topic": topic, "max_generations": str(maximum)}
+    for key, value in expected.items():
+        if state.get(key) != value:
+            errors.append(f"resume {key} does not match the requested immutable identity")
+    if plan != (repo / "PLAN.md").resolve(strict=False):
+        errors.append("resume requires the canonical repository PLAN.md path")
+    if state.get("phase") not in {"reviewing", "awaiting-revision"}:
+        errors.append(f"resume phase is not an interrupted active phase: {state.get('phase')}")
+    generation_raw = state.get("generation", "")
+    generation = int(generation_raw) if generation_raw.isdigit() else 0
+    if not 1 <= generation <= maximum:
+        errors.append("resume generation is invalid")
+    snapshot_hash = state.get("snapshot_sha256", "")
+    generation_dir = review_dir / "generations" / str(generation)
+    try:
+        manifest = json.loads((generation_dir / "manifest.json").read_text(encoding="utf-8"))
+        required = {"generation", "snapshot_sha256", "required_persona_ids", "topic", "source_plan_path", "previous_generation_sha256"}
+        if not isinstance(manifest, dict) or set(manifest) != required:
+            raise ValueError("schema mismatch")
+        if manifest.get("generation") != generation or manifest.get("snapshot_sha256") != snapshot_hash:
+            raise ValueError("generation/hash mismatch")
+        if manifest.get("required_persona_ids") != SWEEP_PERSONAS or manifest.get("topic") != topic:
+            raise ValueError("topic/persona mismatch")
+        if manifest.get("source_plan_path") != str(plan):
+            raise ValueError("source plan path mismatch")
+        if sha256_file(generation_dir / "PLAN.md") != snapshot_hash:
+            raise ValueError("snapshot bytes mismatch")
+        previous_hash: str | None = None
+        for index in range(1, generation + 1):
+            chain_dir = review_dir / "generations" / str(index)
+            chain_manifest = json.loads((chain_dir / "manifest.json").read_text(encoding="utf-8"))
+            if not isinstance(chain_manifest, dict) or set(chain_manifest) != required:
+                raise ValueError(f"generation {index} schema mismatch")
+            chain_hash = chain_manifest.get("snapshot_sha256")
+            if chain_manifest.get("generation") != index or chain_manifest.get("previous_generation_sha256") != previous_hash:
+                raise ValueError(f"generation {index} linkage mismatch")
+            if chain_manifest.get("required_persona_ids") != SWEEP_PERSONAS or chain_manifest.get("topic") != topic or chain_manifest.get("source_plan_path") != str(plan):
+                raise ValueError(f"generation {index} identity mismatch")
+            if not isinstance(chain_hash, str) or not SHA256_RE.fullmatch(chain_hash) or sha256_file(chain_dir / "PLAN.md") != chain_hash:
+                raise ValueError(f"generation {index} snapshot mismatch")
+            if previous_hash is not None and chain_hash == previous_hash:
+                raise ValueError(f"generation {index} did not revise the plan")
+            previous_hash = chain_hash
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        errors.append(f"resume manifest/snapshot is invalid: {exc}")
+    try:
+        live_hash = sha256_file(plan)
+        if state.get("phase") == "reviewing" and live_hash != snapshot_hash:
+            errors.append("live PLAN.md changed while the review was still reviewing")
+    except OSError as exc:
+        errors.append(f"live PLAN.md is unreadable: {exc}")
+    lock_candidates = {
+        "lock": state_dir / f"{review_id}.lock",
+        "active-pgid": state_dir / f"{review_id}-active-pgid",
+        "adapter-lock": state_dir / f"{review_id}.adapter-lock",
+    }
+    for label, candidate in lock_candidates.items():
+        try:
+            if candidate.is_file() and pid_alive(candidate.read_text(encoding="utf-8")):
+                errors.append(f"resume refused because {label} is active")
+        except OSError as exc:
+            errors.append(f"resume could not inspect {label}: {exc}")
+    if errors:
+        raise ValueError("; ".join(errors[:5]))
+    return state_file, review_dir
 
 
 def emit(payload: dict[str, Any], code: int) -> int:
@@ -490,13 +585,14 @@ class JsonArgumentParser(argparse.ArgumentParser):
 
 
 def main() -> int:
-    global _PENDING_PLAN_RESTORE
+    global _PENDING_PLAN_RESTORE, _PENDING_ADAPTER_LOCK
     parser = JsonArgumentParser(description="Run a bounded headless Claudex review of an existing plan")
     parser.add_argument("--repo", required=True, help="absolute repository path")
     parser.add_argument("--plan", required=True, help="absolute path to an existing non-empty PLAN.md")
     parser.add_argument("--topic", required=True, help="self-contained review topic and constraints")
     parser.add_argument("--rounds", required=True, type=int, help="positive Claudex round limit")
     parser.add_argument("--engine", choices=("sweep-v2", "legacy"), default="sweep-v2", help="plan-review engine (default: sweep-v2)")
+    parser.add_argument("--resume-review-id", help="resume one interrupted sweep-v2 review ID")
     parser.add_argument("--timeout", required=True, type=float, help="wall-clock timeout in seconds")
     parser.add_argument("--budget-usd", required=True, help="positive Claude Code budget cap")
     default_plugin = Path(__file__).resolve().parents[1] / "plugins" / "claudex"
@@ -519,6 +615,8 @@ def main() -> int:
             raise ValueError("--rounds must be a positive integer")
         if args.engine == "sweep-v2" and args.rounds > 5:
             raise ValueError("sweep-v2 --rounds must be in 1..5 generations")
+        if args.resume_review_id and args.engine != "sweep-v2":
+            raise ValueError("--resume-review-id is supported only with --engine sweep-v2")
         if args.timeout <= 0:
             raise ValueError("--timeout must be positive")
         if not args.topic.strip():
@@ -543,8 +641,23 @@ def main() -> int:
 
     state_dir = repo / ".claude" / "claudex"
     state_dir.mkdir(parents=True, exist_ok=True)
+    resume_state: Path | None = None
+    if args.resume_review_id:
+        try:
+            resume_state, _ = validate_resume_identity(repo, plan, state_dir, args.resume_review_id, args.topic.strip(), args.rounds)
+            adapter_lock = state_dir / f"{args.resume_review_id}.adapter-lock"
+            if adapter_lock.exists() and not pid_alive(adapter_lock.read_text(encoding="utf-8", errors="replace")):
+                adapter_lock.unlink()
+            fd = os.open(adapter_lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(f"{os.getpid()}\n")
+            _PENDING_ADAPTER_LOCK = adapter_lock
+        except (ValueError, OSError) as exc:
+            return fail(str(exc), kind="resume_validation")
     baseline_states = set(state_dir.glob("*.state"))
     for state_file in baseline_states:
+        if resume_state is not None and state_file == resume_state:
+            continue
         phase = parse_state(state_file).get("phase", "")
         if phase in ACTIVE_PHASES or (phase and phase not in TERMINAL_PHASES):
             return fail(f"active Claudex loop already exists: {state_file} (phase={phase})", kind="active_loop")
@@ -603,7 +716,8 @@ def main() -> int:
         shutil.copy2(plan, runtime_plan)
 
     engine_flag = "--engine sweep-v2 " if args.engine == "sweep-v2" else ""
-    prompt = f"/claudex:plan {engine_flag}--from-draft --skip-interview --rounds {args.rounds} {args.topic.strip()}"
+    resume_flag = f"--resume-review-id {args.resume_review_id} " if args.resume_review_id else "--from-draft "
+    prompt = f"/claudex:plan {engine_flag}{resume_flag}--skip-interview --rounds {args.rounds} {args.topic.strip()}"
     command = [
         str(claude), "--print", "--verbose", "--output-format", "stream-json", "--include-hook-events",
         "--dangerously-skip-permissions", "--setting-sources", "project", "--plugin-dir", str(plugin),
@@ -612,6 +726,7 @@ def main() -> int:
     metadata = {
         "argv": command, "cwd": str(repo), "timeout_seconds": args.timeout,
         "budget_usd": str(budget), "engine": args.engine, "rounds": args.rounds, "topic": args.topic,
+        "resume_review_id": args.resume_review_id,
         "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     (evidence / "run-metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
@@ -622,13 +737,13 @@ def main() -> int:
     started = time.monotonic()
     timed_out = False
     process: subprocess.Popen[bytes] | None = None
-    selected_state: Path | None = None
-    last_state: dict[str, str] | None = None
+    selected_state: Path | None = resume_state
+    last_state: dict[str, str] | None = parse_state(resume_state) if resume_state else None
     try:
         with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr, events_path.open("w", encoding="utf-8") as events:
             process = subprocess.Popen(command, cwd=repo, env=env, stdout=stdout, stderr=stderr, start_new_session=True)
             while process.poll() is None:
-                new_states = [path for path in state_dir.glob("*.state") if path not in baseline_states]
+                new_states = ([resume_state] if resume_state else [path for path in state_dir.glob("*.state") if path not in baseline_states])
                 if new_states:
                     selected_state = max(new_states, key=lambda path: path.stat().st_mtime_ns)
                     last_state = snapshot_state(selected_state, events, last_state)
@@ -643,7 +758,7 @@ def main() -> int:
                     break
                 time.sleep(0.2)
             returncode = process.wait() if process.poll() is None else process.returncode
-            new_states = [path for path in state_dir.glob("*.state") if path not in baseline_states]
+            new_states = ([resume_state] if resume_state else [path for path in state_dir.glob("*.state") if path not in baseline_states])
             if new_states:
                 selected_state = max(new_states, key=lambda path: path.stat().st_mtime_ns)
                 last_state = snapshot_state(selected_state, events, last_state)
@@ -705,8 +820,18 @@ def main() -> int:
     decision = state.get("decision_signal")
     sweep: dict[str, Any] | None = None
     if timed_out:
+        if args.engine == "sweep-v2" and state_identity_valid and evidence_state and evidence_review_dir and not copy_errors:
+            sweep = validate_sweep(
+                evidence_state, evidence_review_dir, findings_dir, runtime_plan,
+                evidence / "PLAN.after.md", args.rounds, args.topic.strip(),
+            )
+            state = sweep["state"]
+            phase = state.get("phase")
+            decision = state.get("decision_signal")
+            findings_status = sweep["findings_status"]
+            severity = sweep["severity_counts"]
         outcome = "timed_out"
-        reason = "wall-clock timeout exceeded; process group terminated and reaped"
+        reason = "wall-clock timeout exceeded; process group terminated and reaped; latest copied sweep progress was revalidated"
     elif returncode != 0:
         outcome = "failed"
         reason = f"Claude Code exited non-zero ({returncode})"
@@ -800,6 +925,7 @@ def main() -> int:
         "claude_session_id": stream_summary.get("session_id"),
     }
     (evidence / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    release_adapter_lock()
     return emit(result, EXIT_CODES[outcome])
 
 
@@ -808,6 +934,7 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception as exc:
         restore_error = restore_pending_plan()
+        release_adapter_lock()
         message = f"unexpected adapter failure: {type(exc).__name__}: {exc}"
         if restore_error:
             message += f"; repository PLAN.md restoration also failed: {restore_error}"

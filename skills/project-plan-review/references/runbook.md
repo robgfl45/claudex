@@ -12,7 +12,7 @@ Resolve all paths before delegation:
 - `CODEX`: vetted absolute Codex executable
 - `EVIDENCE`: new absolute output directory
 - `ROUNDS=5` for the standard project-plan-review sweep
-- positive `TIMEOUT_SECONDS` and `BUDGET_USD`
+- `TIMEOUT_SECONDS=3600` for the standard five-generation sweep and a positive `BUDGET_USD`
 - the Hermes delegation wall-clock limit from `delegation.child_timeout_seconds`
 
 ## Timeout budget invariant
@@ -20,15 +20,21 @@ Resolve all paths before delegation:
 The outer Hermes leaf must outlive the adapter plus artifact read-back and summary. Before calling `delegate_task`, read `delegation.child_timeout_seconds` from the active profile and require one of:
 
 - `child_timeout_seconds: 0` (no delegation wall-clock cap), or
-- `child_timeout_seconds >= TIMEOUT_SECONDS + 180`.
+- `child_timeout_seconds >= 4200` for the standard 3,600-second adapter run (and always at least `TIMEOUT_SECONDS + 180`).
 
-The 180-second reserve is mandatory. Never give the adapter a timeout equal to or greater than the child timeout. If this invariant is violated, the adapter can finish while Hermes reports the leaf as timed out before artifact verification. A timed-out outer leaf is not proof that the adapter failed: inspect `result.json`, process state, and copied evidence before classifying or retrying.
+The 180-second reserve is mandatory; the standard outer timeout is deliberately at least 4,200 seconds. Never give the adapter a timeout equal to or greater than the child timeout. If this invariant is violated, the adapter can finish while Hermes reports the leaf as timed out before artifact verification. A timed-out outer leaf is not proof that the adapter failed: inspect `result.json`, process state, and copied evidence before classifying or retrying.
 
 ## `delegate_task` goal/context template
 
 Use the available `delegate_task` tool with a prompt equivalent to this, filling every placeholder:
 
-> You are a leaf execution subagent. Do not ask Rob questions and do not delegate. Run exactly one bounded sweep-v2 plan-review adapter operation, then return the exact JSON result and absolute artifact paths. Repository: `<REPO>`. Existing plan: `<PLAN>`. Grounded topic/constraints: `<SELF-CONTAINED TOPIC>`. Adapter: `<ADAPTER>`. Claudex plugin root: `<PLUGIN_ROOT>`. Claude executable: `<CLAUDE>`. Codex executable: `<CODEX>`. Evidence directory: `<EVIDENCE>`. Run: `<ADAPTER> --repo <REPO> --plan <PLAN> --topic <TOPIC> --engine sweep-v2 --rounds 5 --timeout <TIMEOUT_SECONDS> --budget-usd <BUDGET_USD> --plugin-root <PLUGIN_ROOT> --claude <CLAUDE> --codex <CODEX> --output-dir <EVIDENCE>`. Preserve stdout exactly. A nonzero exit is an outcome to report, not a reason to improvise. Do not implement, commit, push, install skills/plugins, edit global configuration, or touch files outside the adapter's documented scope. Before returning, verify `result.json`, final plan, copied state, generation manifest, generation evidence directory, and consolidated findings exist. Return outcome, exit code, generation/max-generations, snapshot hashes, persona coverage, and paths; never call a non-converged run clean.
+> You are a leaf execution subagent. Do not ask Rob questions and do not delegate. Run exactly one bounded sweep-v2 plan-review adapter operation, then return the exact JSON result and absolute artifact paths. Repository: `<REPO>`. Existing plan: `<PLAN>`. Grounded topic/constraints: `<SELF-CONTAINED TOPIC>`. Adapter: `<ADAPTER>`. Claudex plugin root: `<PLUGIN_ROOT>`. Claude executable: `<CLAUDE>`. Codex executable: `<CODEX>`. Evidence directory: `<EVIDENCE>`. Run: `<ADAPTER> --repo <REPO> --plan <PLAN> --topic <TOPIC> --engine sweep-v2 --rounds 5 --timeout 3600 --budget-usd <BUDGET_USD> --plugin-root <PLUGIN_ROOT> --claude <CLAUDE> --codex <CODEX> --output-dir <EVIDENCE>`. Preserve stdout exactly. A nonzero exit is an outcome to report, not a reason to improvise. Do not implement, commit, push, install skills/plugins, edit global configuration, or touch files outside the adapter's documented scope. Before returning, verify `result.json`, final plan, copied state, generation manifest, generation evidence directory, and consolidated findings exist. Return outcome, exit code, generation/max-generations, snapshot hashes, persona coverage, and paths; never call a non-converged run clean.
+
+## Resume-first interruption recovery
+
+If the adapter or outer child is interrupted, first inspect the copied `result.json`, source process/lock state, and preserved review tree. If the source is an eligible interrupted `reviewing` or `awaiting-revision` sweep, use a new empty evidence directory and rerun the same command with `--resume-review-id <REVIEW_ID>`. Keep the exact repository, canonical plan path, logical topic, `sweep-v2` engine, and `--rounds 5`; use `--timeout 3600` and an outer child timeout of at least 4,200 seconds. Do not start a fresh review merely because the prior adapter timed out.
+
+Resume is fail-closed: held locks/processes, terminal states, identity mismatches, changed live plans during `reviewing`, or malformed/mutated evidence are not reusable. Valid completed personas are reused only in the same immutable generation/hash; only missing personas run. A changed plan from `awaiting-revision` is frozen as a new generation and receives all five reviews, so approvals never cross a plan revision.
 
 Do not omit context on the assumption the child can read the parent conversation. It cannot ask the user to fill gaps.
 

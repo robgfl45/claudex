@@ -23,7 +23,7 @@ Interactive review mode and the plugin's legacy plan mode are unchanged.
   --topic "grounded feature scope, constraints, and explicit non-goals" \
   --engine sweep-v2 \
   --rounds 5 \
-  --timeout 900 \
+  --timeout 3600 \
   --budget-usd 5.00 \
   --plugin-root /absolute/path/to/claudex/plugins/claudex \
   --claude /absolute/path/to/claude \
@@ -32,6 +32,8 @@ Interactive review mode and the plugin's legacy plan mode are unchanged.
 ```
 
 `--engine` defaults to `sweep-v2`; its `--rounds` value is the maximum generation count and must be `1..5`. The Hermes project-plan-review workflow uses five. Pass `--engine legacy` for backward-compatible round behavior. `--output-dir` is optional; the default is `.claude/claudex/adapter-runs/<timestamp>-<id>`. `--model` defaults to `sonnet`.
+
+To continue an interrupted sweep, pass `--resume-review-id <id>` with the exact same canonical repository `PLAN.md`, topic, engine, and generation cap, plus a new empty output directory. Resume rejects active locks/processes and terminal or mismatched state before provider launch. It reuses only complete valid persona evidence from the current immutable generation and runs only missing personas; invalid existing evidence degrades without overwrite.
 
 Stdout contains exactly one compact JSON object. Diagnostics go to evidence files. Exit codes:
 
@@ -61,7 +63,7 @@ The state and full review directory—including every generation—are copied in
 
 Claude Code and Codex are subscription-backed in this workflow. `--budget-usd`, Claude's `--max-budget-usd`, and `reported_claude_cost_usd` are CLI usage-equivalent telemetry and a bounded-run control; they do not prove direct API billing or represent an invoice. Codex subscription usage is separate, may be rate-limited, and cannot be dollar-enforced or measured by this adapter. A sweep generation can invoke all five Codex personas. The timeout is a wall-clock safety boundary, not a billing guarantee.
 
-For Hermes delegation, keep the outer child deadline at least 180 seconds beyond the adapter timeout so the leaf can read and report evidence.
+For the standard five-generation run, use a 3,600-second adapter timeout and an outer child deadline of at least 4,200 seconds. After interruption, inspect evidence and resume the preserved review first rather than starting a new review ID.
 
 ## Installation and Hermes skill staging
 
