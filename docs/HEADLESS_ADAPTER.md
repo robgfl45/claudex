@@ -24,7 +24,7 @@ Interactive review mode and the plugin's legacy plan mode are unchanged.
   --engine sweep-v2 \
   --rounds 5 \
   --timeout 3600 \
-  --budget-usd 5.00 \
+  --budget-usd 10.00 \
   --plugin-root /absolute/path/to/claudex/plugins/claudex \
   --claude /absolute/path/to/claude \
   --codex /absolute/path/to/codex \
