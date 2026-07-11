@@ -12,6 +12,16 @@ Resolve all paths before delegation:
 - `CODEX`: vetted absolute Codex executable
 - `EVIDENCE`: new absolute output directory
 - positive `ROUNDS`, `TIMEOUT_SECONDS`, and `BUDGET_USD`
+- the Hermes delegation wall-clock limit from `delegation.child_timeout_seconds`
+
+## Timeout budget invariant
+
+The outer Hermes leaf must outlive the adapter plus artifact read-back and summary. Before calling `delegate_task`, read `delegation.child_timeout_seconds` from the active profile and require one of:
+
+- `child_timeout_seconds: 0` (no delegation wall-clock cap), or
+- `child_timeout_seconds >= TIMEOUT_SECONDS + 180`.
+
+Never give the adapter a timeout equal to or greater than the child timeout. If this invariant is violated, the adapter can finish successfully while Hermes reports the leaf as timed out before it returns its summary. For a normal three-round review, use an adapter timeout of 900 seconds and a child timeout of at least 1080 seconds. A timed-out outer leaf is not proof that the adapter failed: inspect `result.json`, process state, and evidence directly before classifying the run or retrying.
 
 ## `delegate_task` goal/context template
 
