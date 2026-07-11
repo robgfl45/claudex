@@ -225,6 +225,43 @@ check "status.sh runs without error on empty state" bash -c "
   exit \$rc
 "
 
+section "15. Safe state field updates"
+TMP=$(mktemp -d)
+SAFE_STATE="$TMP/safe.state"
+claudex_state_write "$SAFE_STATE" "phase: drafting
+note: old
+last_updated_at: 2026-04-26T00:00:00Z"
+special_value='path/with/slashes & ampersand'
+check "set_field accepts slash and ampersand" \
+  claudex_state_set_field "$SAFE_STATE" note "$special_value"
+actual_value=$(claudex_state_read_field "$SAFE_STATE" note)
+check "slash and ampersand survive literally" test "$actual_value" = "$special_value"
+newline_value=$(printf 'first line\nsecond/line & value')
+check "set_field accepts embedded newline" \
+  claudex_state_set_field "$SAFE_STATE" note "$newline_value"
+actual_value=$(claudex_state_read_field "$SAFE_STATE" note)
+check "newline is safely normalized for single-line state" \
+  test "$actual_value" = "first line second/line & value"
+check "invalid field name rejected" \
+  bash -c "! claudex_state_set_field '$SAFE_STATE' 'bad/field' value"
+rm -rf "$TMP"
+
+section "16. Canonical repository root"
+TMP=$(mktemp -d)
+mkdir -p "$TMP/real"
+ln -s "$TMP/real" "$TMP/alias"
+( cd "$TMP/alias" && export CLAUDEX_STATE_DIR=.claude/claudex && \
+  bash "$PLUGIN_ROOT/scripts/start-loop.sh" plan "canonical path test" >/dev/null 2>&1 )
+CANON_STATE=$(ls "$TMP/real/.claude/claudex"/*.state 2>/dev/null | head -1)
+stored_root=$(claudex_state_read_field "$CANON_STATE" repo_root)
+expected_root=$(cd "$TMP/real" && pwd -P)
+check "start-loop stores physical pwd" test "$stored_root" = "$expected_root"
+rm -rf "$TMP"
+
+section "17. Installer validation path"
+check "install.sh targets nested plugin test path" \
+  grep -q '\$PLUGIN_ROOT/plugins/claudex/tests/platform-validation.sh' "$PLUGIN_ROOT/../../install.sh"
+
 # Summary
 printf '\n\033[1m=== Results ===\033[0m\n'
 printf '  \033[32m%d passed\033[0m\n' "$pass"

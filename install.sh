@@ -130,10 +130,10 @@ note "After /reload-plugins, /claudex should appear in your slash command list."
 # ─────────────────────────────────────────────
 hdr "7. Platform validation"
 # ─────────────────────────────────────────────
-if [ -x "$PLUGIN_ROOT/tests/platform-validation.sh" ]; then
+if [ -x "$PLUGIN_ROOT/plugins/claudex/tests/platform-validation.sh" ]; then
   echo "Running platform-validation.sh..."
   echo ""
-  if bash "$PLUGIN_ROOT/tests/platform-validation.sh" 2>&1 | tail -5; then
+  if bash "$PLUGIN_ROOT/plugins/claudex/tests/platform-validation.sh" 2>&1 | tail -5; then
     :
   else
     failures=$((failures+1))

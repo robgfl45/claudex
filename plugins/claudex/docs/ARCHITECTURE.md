@@ -52,11 +52,12 @@ USER: /claudex:plan add expiry dates
   ┌─────────────────────┐
   │ stop-hook.sh        │ Reads state file
   └─────────────────────┘ phase=reviewing
-              │           → If signal=no-material-findings: ALLOW + cleanup
-              │           → If round >= max: ALLOW + "stopped at max"
+              │           → If signal=no-material-findings: summary BLOCK
+              │           → If round >= max: summary BLOCK
               │           → Else: increment round, BLOCK with new round
               ▼
-  CLAUDE either revises PLAN.md (loops back) OR exits cleanly
+  CLAUDE either revises PLAN.md (loops back) OR prints the summary
+  Next Stop hook: summarizing → done → APPROVE + cleanup
 ```
 
 ## The state file
@@ -116,7 +117,8 @@ Every error path leads to approve. The plugin is not allowed to break the user's
 The hook branches on `mode` (plan or review) and then on `phase`. Plan mode has the most states:
 
 - `drafting` → check PLAN.md, transition to reviewing, write runner, BLOCK
-- `reviewing` → check decision_signal, either ALLOW (done/max) or increment round + BLOCK
+- `reviewing` → check decision_signal, either transition to `summarizing` + BLOCK or increment round + BLOCK
+- `summarizing` → transition to `done`, cleanup + ALLOW
 - `done` → cleanup + ALLOW
 - `cancelled` → cleanup + ALLOW
 
@@ -141,7 +143,7 @@ The runner script includes:
 
 The challenge: hooks fire AFTER Claude finishes a turn. So how does Claude tell the hook "the loop should end now"?
 
-Answer: Claude updates the state file before ending its turn. Specifically, Claude runs `mark-done.sh` which sets `phase=done` and `decision_signal=no-material-findings`. The hook reads those fields on its next fire and ALLOWs exit.
+Answer: Claude updates the state file before ending its turn. Specifically, Claude runs `mark-done.sh`, which leaves `phase=reviewing` and sets `decision_signal=no-material-findings`. The hook reads those fields on its next fire, transitions to `summarizing`, and BLOCKs once so Claude prints the user-visible summary. The following fire transitions to `done` and ALLOWs exit.
 
 This is just a state machine using the file system as a synchronization channel. Simple. Robust. Survives crashes.
 
