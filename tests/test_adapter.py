@@ -406,11 +406,13 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         external = self.base / "external.md"
         external.write_text(self.plan.read_text())
         completed, result = self.run_adapter(plan=external, resume_id=interrupted["review_id"], extra_env={"FAKE_PROMPT_FILE": str(marker)})
+        self.assertEqual(completed.returncode, 12)
         self.assertEqual(result["error"]["kind"], "resume_validation")
         self.assertFalse(marker.exists())
         state = Path(interrupted["source_state_file"])
         state.write_text(state.read_text().replace("phase: reviewing", "phase: cancelled"))
         completed, result = self.run_adapter(resume_id=interrupted["review_id"], extra_env={"FAKE_PROMPT_FILE": str(marker)})
+        self.assertEqual(completed.returncode, 12)
         self.assertEqual(result["error"]["kind"], "resume_validation")
         self.assertFalse(marker.exists())
 

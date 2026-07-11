@@ -470,6 +470,14 @@ echo '{}' | bash "$HOOK" >/dev/null 2>&1
 check "awaiting-revision resumes after valid plan change and creates next generation" bash -c "[ \"\$(sed -n 's/^generation: *//p' '$STATE')\" = 2 ] && [ \"\$(sed -n 's/^phase: *//p' '$STATE')\" = reviewing ]"
 
 new_repo; start_sweep
+OTHER_ID="20990101-010101-abcdef"
+cp "$STATE" ".claude/claudex/$OTHER_ID.state"
+sed -i.bak "s/^review_id:.*/review_id: $OTHER_ID/" ".claude/claudex/$OTHER_ID.state"; rm -f ".claude/claudex/$OTHER_ID.state.bak"
+check "another active review blocks resume" bash -c "! bash '$START' plan --engine sweep-v2 --resume-review-id '$ID' --rounds 5 'deterministic sweep test' >/dev/null 2>&1"
+rm -f ".claude/claudex/$OTHER_ID.state"
+mkdir ".claude/claudex/$ID.lock.resume-guard"
+check "atomic resume guard rejects concurrent resume" bash -c "! bash '$START' plan --engine sweep-v2 --resume-review-id '$ID' --rounds 5 'deterministic sweep test' >/dev/null 2>&1"
+rmdir ".claude/claudex/$ID.lock.resume-guard"
 rm -f ".claude/claudex/$ID.lock"; printf '999999\n' > ".claude/claudex/$ID.lock"
 check "stale unheld lock inode is accepted" bash -c "bash '$START' plan --engine sweep-v2 --resume-review-id '$ID' --rounds 5 'deterministic sweep test' >/dev/null 2>&1"
 printf '%s\n' "$$" > ".claude/claudex/$ID.lock"

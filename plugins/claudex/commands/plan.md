@@ -18,7 +18,7 @@ Parse these flags from the start of $ARGUMENTS (the script handles them; you mai
 - `--from-draft`. Use the existing `PLAN.md` in the project root instead of drafting from scratch. PLAN.md must exist and be non-empty.
 - `--skip-interview`. Bypass the topic-sharpening interview offer in step 2 below. Useful when you've already nailed the topic or you're in a rush.
 - `--engine sweep-v2`. Opt into the Phase 1 frozen-snapshot engine. It requires an existing non-empty `PLAN.md`, runs all five required personas sequentially per generation, defaults to five generations, and never permits more than five. Omit this flag for unchanged legacy plan mode.
-- `--resume-review-id ID`. Resume one interrupted sweep-v2 review with exact repository/topic/path/cap binding. Valid completed same-generation persona evidence is reused; invalid evidence degrades and is never replaced.
+- `--resume-review-id ID`. Resume one interrupted sweep-v2 review with exact repository, topic, canonical plan path, and maximum-generation binding. Valid completed same-generation persona evidence is reused; invalid evidence degrades and is never replaced.
 
 ## Procedure
 

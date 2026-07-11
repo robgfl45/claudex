@@ -170,7 +170,27 @@ if [ -n "$RESUME_REVIEW_ID" ]; then
   STATE_FILE="$CLAUDEX_STATE_DIR/$RESUME_REVIEW_ID.state"
   REVIEW_DIR="$CLAUDEX_STATE_DIR/$RESUME_REVIEW_ID"
   [ -f "$STATE_FILE" ] && [ -d "$REVIEW_DIR" ] || { echo "Resume state/evidence does not exist." >&2; exit 2; }
+  # Resume must preserve the repository-wide single-loop invariant. Ignore the
+  # target state itself, but refuse while any other nonterminal loop exists.
+  for OTHER_STATE in "$CLAUDEX_STATE_DIR"/*.state; do
+    [ -f "$OTHER_STATE" ] || continue
+    [ "$(basename "$OTHER_STATE" .state)" = "$RESUME_REVIEW_ID" ] && continue
+    OTHER_PHASE=$(claudex_state_read_field "$OTHER_STATE" phase)
+    case "$OTHER_PHASE" in
+      done|cancelled|errored|"") ;;
+      *)
+        echo "Resume refused: another claudex loop is active ($(basename "$OTHER_STATE" .state), phase: $OTHER_PHASE)." >&2
+        exit 1
+        ;;
+    esac
+  done
   LOCK_FILE="$CLAUDEX_STATE_DIR/$RESUME_REVIEW_ID.lock"
+  RESUME_GUARD="${LOCK_FILE}.resume-guard"
+  if ! mkdir "$RESUME_GUARD" 2>/dev/null; then
+    echo "Resume refused: another resume owns the atomic guard (remove it manually only after proving no resume process exists)." >&2
+    exit 1
+  fi
+  trap 'rmdir "$RESUME_GUARD" 2>/dev/null || true' EXIT
   ACTIVE_PGID_FILE="$CLAUDEX_STATE_DIR/$RESUME_REVIEW_ID-active-pgid"
   if claudex_lock_is_active "$LOCK_FILE"; then
     echo "Resume refused: review lock is held." >&2
@@ -190,6 +210,10 @@ if [ -n "$RESUME_REVIEW_ID" ]; then
       ;;
   esac
   rm -f "$LOCK_FILE" "$ACTIVE_PGID_FILE"
+  if ! (set -C; umask 077; printf '%s\n' "$$" > "$LOCK_FILE") 2>/dev/null; then
+    echo "Resume refused: another resume acquired the review lock." >&2
+    exit 1
+  fi
   PHASE=$(claudex_state_read_field "$STATE_FILE" phase)
   GENERATION=$(claudex_state_read_field "$STATE_FILE" generation)
   SNAPSHOT_SHA=$(claudex_state_read_field "$STATE_FILE" snapshot_sha256)
@@ -246,7 +270,6 @@ PY
   if [ "$PHASE" = reviewing ]; then
     claudex_sweep_write_runner "$STATE_FILE" "$RESUME_REVIEW_ID" "$GENERATION" "$STORED_TOPIC" "$SNAPSHOT_SHA" || exit 3
   fi
-  claudex_lock_write "$LOCK_FILE" || exit 3
   echo "Claudex sweep-v2 review resumed."
   echo "Review ID: $RESUME_REVIEW_ID"
   echo "Generation: $GENERATION of $STORED_MAX"
