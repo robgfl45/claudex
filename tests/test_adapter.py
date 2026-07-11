@@ -224,6 +224,8 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         runbook = (ROOT / "skills" / "project-plan-review" / "references" / "runbook.md").read_text()
         skill = (ROOT / "skills" / "project-plan-review" / "SKILL.md").read_text()
         self.assertIn("TIMEOUT_SECONDS=3600", runbook)
+        self.assertIn("BUDGET_USD=10", runbook)
+        self.assertIn("TIMEOUT_SECONDS + 300", runbook)
         self.assertIn("child_timeout_seconds >= 4200", runbook)
         self.assertIn("--resume-review-id <REVIEW_ID>", runbook)
         self.assertIn("outer child timeout of at least 4,200 seconds", skill)
