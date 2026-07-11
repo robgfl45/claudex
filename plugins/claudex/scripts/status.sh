@@ -38,6 +38,7 @@ fi
 REVIEW_ID=$(basename "$ACTIVE" .state)
 
 MODE=$(claudex_state_read_field        "$ACTIVE" "mode")
+ENGINE=$(claudex_state_read_field      "$ACTIVE" "engine")
 PHASE=$(claudex_state_read_field       "$ACTIVE" "phase")
 ROUND=$(claudex_state_read_field       "$ACTIVE" "round")
 MAX_ROUNDS=$(claudex_state_read_field  "$ACTIVE" "max_rounds")
@@ -47,6 +48,11 @@ STARTED=$(claudex_state_read_field     "$ACTIVE" "started_at")
 STARTED_EPOCH=$(claudex_state_read_field "$ACTIVE" "started_at_epoch")
 INTERVIEW=$(claudex_state_read_field   "$ACTIVE" "interview_used")
 FROM_DRAFT=$(claudex_state_read_field  "$ACTIVE" "from_draft")
+GENERATION=$(claudex_state_read_field  "$ACTIVE" "generation")
+MAX_GENERATIONS=$(claudex_state_read_field "$ACTIVE" "max_generations")
+SNAPSHOT_SHA=$(claudex_state_read_field "$ACTIVE" "snapshot_sha256")
+COVERAGE=$(claudex_state_read_field    "$ACTIVE" "coverage_complete")
+CLEAN=$(claudex_state_read_field       "$ACTIVE" "clean")
 
 # Phase color.
 case "$PHASE" in
@@ -92,6 +98,7 @@ RUNNER_LINE="${C_DIM}none${C_RESET}"
 printf '%s%s claudex %s%s\n' "$C_BOLD" "─────" "─────" "$C_RESET"
 printf '  %-13s %s\n' "review_id"  "$REVIEW_ID"
 printf '  %-13s %s\n' "mode"       "$MODE"
+[ -n "$ENGINE" ] && printf '  %-13s %s\n' "engine" "$ENGINE"
 printf '  %-13s %s%s%s\n' "phase"  "$PHASE_COLOR" "$PHASE" "$C_RESET"
 if [ -n "$ROUND" ] && [ -n "$MAX_ROUNDS" ]; then
   # Cap displayed round at max_rounds. The internal counter increments past
@@ -102,6 +109,12 @@ if [ -n "$ROUND" ] && [ -n "$MAX_ROUNDS" ]; then
     display_round="$MAX_ROUNDS"
   fi
   printf '  %-13s %s of %s\n' "round" "$display_round" "$MAX_ROUNDS"
+fi
+if [ "$ENGINE" = "sweep-v2" ]; then
+  printf '  %-13s %s of %s\n' "generation" "$GENERATION" "$MAX_GENERATIONS"
+  printf '  %-13s %s\n' "snapshot" "$SNAPSHOT_SHA"
+  printf '  %-13s %s\n' "coverage" "$COVERAGE"
+  printf '  %-13s %s\n' "clean" "$CLEAN"
 fi
 [ -n "$TOPIC" ]      && printf '  %-13s %s\n' "topic"      "$TOPIC"
 [ -n "$STARTED" ]    && printf '  %-13s %s\n' "started_at" "$STARTED"

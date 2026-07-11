@@ -96,6 +96,7 @@ PLUGIN_FILES=(
   "hooks/hooks.json"
   "scripts/state-helpers.sh"
   "scripts/personas.sh"
+  "scripts/sweep-helpers.sh"
   "scripts/start-loop.sh"
   "scripts/cancel-loop.sh"
   "scripts/rollback-loop.sh"
@@ -140,6 +141,8 @@ check "state-helpers source cleanly" \
   bash -c "source '$CLAUDE_PLUGIN_ROOT/scripts/state-helpers.sh'"
 check "personas source cleanly" \
   bash -c "source '$CLAUDE_PLUGIN_ROOT/scripts/personas.sh'"
+check "sweep helpers source cleanly" \
+  bash -c "source '$CLAUDE_PLUGIN_ROOT/scripts/sweep-helpers.sh'"
 if source "$CLAUDE_PLUGIN_ROOT/scripts/personas.sh" 2>/dev/null; then
   R1=$(claudex_persona_for_round 1)
   R2=$(claudex_persona_for_round 2)

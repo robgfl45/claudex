@@ -52,6 +52,8 @@ trap 'log "ERR trap at line $LINENO; failing open"; printf "{\"decision\":\"appr
 source "$CLAUDE_PLUGIN_ROOT/scripts/state-helpers.sh" 2>/dev/null || approve "state-helpers missing"
 # shellcheck source=/dev/null
 source "$CLAUDE_PLUGIN_ROOT/scripts/personas.sh" 2>/dev/null || approve "personas missing"
+# shellcheck source=/dev/null
+source "$CLAUDE_PLUGIN_ROOT/scripts/sweep-helpers.sh" 2>/dev/null || approve "sweep helpers missing"
 
 # Read hook input from stdin (Claude Code sends JSON).
 HOOK_INPUT=""
@@ -80,6 +82,8 @@ fi
 
 # Read state fields.
 MODE=$(claudex_state_read_field "$ACTIVE_STATE" "mode")
+ENGINE=$(claudex_state_read_field "$ACTIVE_STATE" "engine")
+[ -n "$ENGINE" ] || ENGINE="legacy"
 PHASE=$(claudex_state_read_field "$ACTIVE_STATE" "phase")
 ROUND=$(claudex_state_read_field "$ACTIVE_STATE" "round")
 MAX_ROUNDS=$(claudex_state_read_field "$ACTIVE_STATE" "max_rounds")
@@ -202,7 +206,140 @@ RUNNEREOF
   chmod +x "$RUNNER"
 }
 
-# === PLAN MODE LIFECYCLE ===
+# === SWEEP-V2 PLAN LIFECYCLE ===
+
+if [ "$MODE" = "plan" ] && [ "$ENGINE" = "sweep-v2" ]; then
+  GENERATION=$(claudex_state_read_field "$ACTIVE_STATE" generation)
+  MAX_GENERATIONS=$(claudex_state_read_field "$ACTIVE_STATE" max_generations)
+  SNAPSHOT_SHA=$(claudex_state_read_field "$ACTIVE_STATE" snapshot_sha256)
+  COVERAGE_COMPLETE=$(claudex_state_read_field "$ACTIVE_STATE" coverage_complete)
+  case "$GENERATION" in ''|*[!0-9]*) GENERATION=1 ;; esac
+  case "$MAX_GENERATIONS" in ''|*[!0-9]*) MAX_GENERATIONS=5 ;; esac
+  [ "$MAX_GENERATIONS" -le 5 ] || MAX_GENERATIONS=5
+  GENERATION_DIR="$REVIEW_DIR/generations/$GENERATION"
+  CONSOLIDATED="$GENERATION_DIR/consolidated-findings.md"
+
+  case "$PHASE" in
+    reviewing)
+      block "### Claudex sweep-v2 generation $GENERATION of $MAX_GENERATIONS
+
+All five required personas will run sequentially against one frozen snapshot.
+
+**Snapshot:** \`$GENERATION_DIR/PLAN.md\`
+**SHA-256:** \`$SNAPSHOT_SHA\`
+
+Run the deterministic runner:
+
+\`\`\`
+bash $RUNNER
+\`\`\`
+
+Do not edit the snapshot or live \`PLAN.md\` while it runs. When it finishes, end your turn."
+      ;;
+
+    awaiting-revision)
+      CURRENT_LIVE_SHA=$(claudex_sha256 PLAN.md 2>/dev/null)
+      if [ -z "$CURRENT_LIVE_SHA" ] || [ "$CURRENT_LIVE_SHA" = "$SNAPSHOT_SHA" ]; then
+        block "Sweep-v2 found material issues in generation $GENERATION. Read \`$CONSOLIDATED\`, revise live \`PLAN.md\` exactly once, and add or update \`## Changelog\` recording each accepted or rejected item with reasons. Do not modify the frozen snapshot. Then end your turn."
+      fi
+      if ! grep -qE '^## Changelog[[:space:]]*$' PLAN.md 2>/dev/null; then
+        block "The required plan revision exists, but \`PLAN.md\` has no \`## Changelog\`. Record accepted and rejected consolidated findings with reasons, then end your turn."
+      fi
+      NEW_GENERATION=$((GENERATION + 1))
+      if [ "$NEW_GENERATION" -gt "$MAX_GENERATIONS" ] || [ "$NEW_GENERATION" -gt 5 ]; then
+        claudex_state_set_field "$ACTIVE_STATE" decision_signal max-reached
+        claudex_state_set_field "$ACTIVE_STATE" clean false
+        claudex_state_set_field "$ACTIVE_STATE" phase summarizing
+        block "Sweep-v2 reached its hard generation limit without unanimous clean coverage. End your turn to receive the terminal summary."
+      fi
+      NEW_SHA=$(claudex_sweep_create_generation "$ACTIVE_STATE" "$REVIEW_ID" "$NEW_GENERATION" "$TOPIC" "$SNAPSHOT_SHA") || {
+        claudex_state_set_field "$ACTIVE_STATE" decision_signal degraded
+        claudex_state_set_field "$ACTIVE_STATE" clean false
+        claudex_state_set_field "$ACTIVE_STATE" phase summarizing
+        block "Sweep-v2 degraded while creating generation $NEW_GENERATION. No clean result is claimed. End your turn for the terminal summary."
+      }
+      claudex_state_set_field "$ACTIVE_STATE" round "$NEW_GENERATION"
+      claudex_state_set_field "$ACTIVE_STATE" phase reviewing
+      claudex_sweep_write_runner "$ACTIVE_STATE" "$REVIEW_ID" "$NEW_GENERATION" "$TOPIC" "$NEW_SHA" || {
+        claudex_state_set_field "$ACTIVE_STATE" decision_signal degraded
+        claudex_state_set_field "$ACTIVE_STATE" clean false
+        claudex_state_set_field "$ACTIVE_STATE" phase summarizing
+        block "Sweep-v2 degraded while writing the generation runner. No clean result is claimed."
+      }
+      block "### Claudex sweep-v2 generation $NEW_GENERATION of $MAX_GENERATIONS
+
+The revised plan was frozen as a new immutable snapshot.
+
+**Snapshot:** \`$REVIEW_DIR/generations/$NEW_GENERATION/PLAN.md\`
+**SHA-256:** \`$NEW_SHA\`
+
+Run all five personas sequentially:
+
+\`\`\`
+bash $RUNNER
+\`\`\`
+
+When the runner finishes, end your turn."
+      ;;
+
+    summarizing)
+      # Revalidate every current-generation artifact at summary time so a
+      # post-run mutation cannot ride a previously clean state signal.
+      claudex_sweep_consolidate "$ACTIVE_STATE" "$REVIEW_ID" "$GENERATION" "$SNAPSHOT_SHA" "$SNAPSHOT_SHA" >/dev/null 2>&1
+      SIGNAL=$(claudex_state_read_field "$ACTIVE_STATE" decision_signal)
+      CLEAN=$(claudex_state_read_field "$ACTIVE_STATE" clean)
+      CONVERGED_SHA=$(claudex_state_read_field "$ACTIVE_STATE" converged_snapshot_sha256)
+      claudex_state_set_field "$ACTIVE_STATE" phase done
+      rm -f "$RUNNER" "$STATE_DIR/$REVIEW_ID-prompt.txt" "$STATE_DIR/$REVIEW_ID.lock" 2>/dev/null
+      case "$SIGNAL" in
+        converged)
+          block "### Claudex sweep-v2 complete ✓
+
+All five required personas returned exact clean findings against the same generation-$GENERATION snapshot hash.
+
+**Converged SHA-256:** \`$CONVERGED_SHA\`
+**Coverage complete:** $COVERAGE_COMPLETE
+**Clean:** $CLEAN
+
+Print this summary to the user, then end your turn."
+          ;;
+        max-reached)
+          block "### Claudex sweep-v2 stopped at max generations
+
+Generation $GENERATION still had material findings. The result is terminal and explicitly not clean; no unreviewed revision is accepted.
+
+**Consolidated findings:** \`$CONSOLIDATED\`
+**Clean:** false
+
+Print this summary to the user, then end your turn."
+          ;;
+        *)
+          block "### Claudex sweep-v2 degraded
+
+A required persona artifact was missing, malformed, nonzero, hash-mismatched, or mutation was detected. Coverage is incomplete and no clean result is claimed.
+
+**Generation:** $GENERATION
+**Consolidated findings:** \`$CONSOLIDATED\`
+**Clean:** false
+
+Print this summary to the user, then end your turn."
+          ;;
+      esac
+      ;;
+
+    done)
+      rm -f "$RUNNER" "$STATE_DIR/$REVIEW_ID-prompt.txt" "$STATE_DIR/$REVIEW_ID.lock" 2>/dev/null
+      approve "sweep-v2 loop done"
+      ;;
+
+    *)
+      log "Unknown sweep-v2 phase: $PHASE"
+      approve "unknown sweep-v2 phase, fail-open"
+      ;;
+  esac
+fi
+
+# === LEGACY PLAN MODE LIFECYCLE ===
 
 if [ "$MODE" = "plan" ]; then
   case "$PHASE" in
