@@ -35,6 +35,25 @@ SWEEP_PERSONAS = [
     "operations-deployment",
 ]
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_PENDING_PLAN_RESTORE: tuple[Path, Path, bool] | None = None
+
+
+def restore_pending_plan() -> str | None:
+    """Best-effort restoration for an externally staged repository PLAN.md."""
+    global _PENDING_PLAN_RESTORE
+    pending = _PENDING_PLAN_RESTORE
+    if pending is None:
+        return None
+    runtime_plan, original_plan, had_original = pending
+    try:
+        if had_original:
+            shutil.copy2(original_plan, runtime_plan)
+        else:
+            runtime_plan.unlink(missing_ok=True)
+    except OSError as exc:
+        return str(exc)
+    _PENDING_PLAN_RESTORE = None
+    return None
 
 
 def emit(payload: dict[str, Any], code: int) -> int:
@@ -202,7 +221,7 @@ def render_sweep_findings(path: Path, persona: str) -> str:
     return "\n".join(rendered)
 
 
-def validate_sweep(state_file: Path, review_dir: Path, runtime_plan: Path, reviewed_plan: Path, requested: int) -> dict[str, Any]:
+def validate_sweep(state_file: Path, review_dir: Path, source_review_dir: Path, runtime_plan: Path, reviewed_plan: Path, requested: int, requested_topic: str) -> dict[str, Any]:
     """Recompute a sweep verdict from runner-authored state and artifacts."""
     state, errors = strict_state(state_file)
     coverage: list[dict[str, Any]] = []
@@ -215,7 +234,7 @@ def validate_sweep(state_file: Path, review_dir: Path, runtime_plan: Path, revie
     generation = integer("generation")
     maximum = integer("max_generations")
     expected_review_id = state_file.stem
-    if state.get("review_id") != expected_review_id or review_dir.name != expected_review_id:
+    if state.get("review_id") != expected_review_id or review_dir.name != expected_review_id or source_review_dir.name != expected_review_id:
         errors.append("state filename, review_id, and review evidence directory do not match")
     if state.get("mode") != "plan":
         errors.append("state mode is not plan")
@@ -223,6 +242,8 @@ def validate_sweep(state_file: Path, review_dir: Path, runtime_plan: Path, revie
         errors.append("state repo_root does not match the reviewed repository")
     if not state.get("topic"):
         errors.append("state topic is empty")
+    elif state.get("topic") != requested_topic:
+        errors.append("state topic does not match the requested topic")
     if state.get("engine") != "sweep-v2":
         errors.append("state engine is not sweep-v2")
     if generation is None or not 1 <= generation <= 5:
@@ -245,14 +266,16 @@ def validate_sweep(state_file: Path, review_dir: Path, runtime_plan: Path, revie
         errors.append("state reviewed_live_sha256 does not match the current snapshot")
 
     manifest: dict[str, Any] = {}
+    manifest_loaded = False
     if manifest_path:
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             if not isinstance(manifest, dict):
                 raise ValueError("manifest is not an object")
+            manifest_loaded = True
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
             errors.append(f"generation manifest is unreadable or malformed: {exc}")
-    if manifest:
+    if manifest_loaded:
         required = {"generation", "snapshot_sha256", "required_persona_ids", "topic", "source_plan_path", "previous_generation_sha256"}
         if set(manifest) != required:
             errors.append("generation manifest fields do not match the sweep-v2 schema")
@@ -266,16 +289,40 @@ def validate_sweep(state_file: Path, review_dir: Path, runtime_plan: Path, revie
             errors.append("generation manifest topic does not match state")
         if manifest.get("source_plan_path") != str(runtime_plan):
             errors.append("generation manifest source plan path is mismatched")
-        if generation == 1 and manifest.get("previous_generation_sha256") is not None:
-            errors.append("generation-one manifest has an unexpected previous hash")
-        elif generation and generation > 1:
+
+    # Validate the complete immutable snapshot chain, not only the immediate
+    # predecessor. This prevents a terminal generation from hiding a missing,
+    # malformed, or unchanged earlier generation.
+    if generation:
+        chain_previous: str | None = None
+        required_manifest_fields = {"generation", "snapshot_sha256", "required_persona_ids", "topic", "source_plan_path", "previous_generation_sha256"}
+        for index in range(1, generation + 1):
+            chain_dir = review_dir / "generations" / str(index)
             try:
-                previous = json.loads((review_dir / "generations" / str(generation - 1) / "manifest.json").read_text(encoding="utf-8"))
-                previous_hash = previous["snapshot_sha256"]
-                if not isinstance(previous_hash, str) or not SHA256_RE.fullmatch(previous_hash) or manifest.get("previous_generation_sha256") != previous_hash:
-                    errors.append("generation manifest previous hash linkage is invalid")
-            except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError):
-                errors.append("previous generation manifest is unreadable or malformed")
+                chain_manifest = json.loads((chain_dir / "manifest.json").read_text(encoding="utf-8"))
+                if not isinstance(chain_manifest, dict) or set(chain_manifest) != required_manifest_fields:
+                    raise ValueError("manifest schema mismatch")
+                chain_hash = chain_manifest.get("snapshot_sha256")
+                if chain_manifest.get("generation") != index:
+                    raise ValueError("generation number mismatch")
+                if chain_manifest.get("required_persona_ids") != SWEEP_PERSONAS:
+                    raise ValueError("persona set mismatch")
+                if chain_manifest.get("topic") != requested_topic:
+                    raise ValueError("topic mismatch")
+                if chain_manifest.get("source_plan_path") != str(runtime_plan):
+                    raise ValueError("source path mismatch")
+                if not isinstance(chain_hash, str) or not SHA256_RE.fullmatch(chain_hash):
+                    raise ValueError("snapshot hash is malformed")
+                if chain_manifest.get("previous_generation_sha256") != chain_previous:
+                    raise ValueError("previous hash linkage mismatch")
+                if chain_previous is not None and chain_hash == chain_previous:
+                    raise ValueError("generation snapshot did not change")
+                if sha256_file(chain_dir / "PLAN.md") != chain_hash:
+                    raise ValueError("snapshot bytes do not match manifest")
+                chain_previous = chain_hash
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                errors.append(f"generation {index} manifest/snapshot chain is invalid: {exc}")
+                break
 
     try:
         if not snapshot or sha256_file(snapshot) != snapshot_hash:
@@ -312,7 +359,7 @@ def validate_sweep(state_file: Path, review_dir: Path, runtime_plan: Path, revie
                 errors.append(f"{persona} sidecar is unreadable or malformed: {exc}")
             if sidecar_data:
                 required = {"persona_id", "expected_snapshot_sha256", "actual_snapshot_sha256_before", "actual_snapshot_sha256_after", "codex_exit_code", "findings_path", "findings_sha256", "findings_classification", "completed_at"}
-                expected_path = str(review_dir / "generations" / str(generation) / findings.name)
+                expected_path = str(source_review_dir / "generations" / str(generation) / findings.name)
                 valid = set(sidecar_data) == required
                 valid &= sidecar_data.get("persona_id") == persona
                 valid &= sidecar_data.get("expected_snapshot_sha256") == snapshot_hash
@@ -427,6 +474,7 @@ class JsonArgumentParser(argparse.ArgumentParser):
 
 
 def main() -> int:
+    global _PENDING_PLAN_RESTORE
     parser = JsonArgumentParser(description="Run a bounded headless Claudex review of an existing plan")
     parser.add_argument("--repo", required=True, help="absolute repository path")
     parser.add_argument("--plan", required=True, help="absolute path to an existing non-empty PLAN.md")
@@ -535,6 +583,7 @@ def main() -> int:
         shutil.copy2(runtime_plan, original_runtime_plan)
     shutil.copy2(plan, evidence / "PLAN.before.md")
     if external_plan:
+        _PENDING_PLAN_RESTORE = (runtime_plan, original_runtime_plan, original_runtime_plan.exists())
         shutil.copy2(plan, runtime_plan)
 
     engine_flag = "--engine sweep-v2 " if args.engine == "sweep-v2" else ""
@@ -597,11 +646,7 @@ def main() -> int:
         shutil.copy2(runtime_plan, evidence / "PLAN.after.md")
         if external_plan:
             shutil.copy2(runtime_plan, plan)
-    if external_plan:
-        if original_runtime_plan.exists():
-            shutil.copy2(original_runtime_plan, runtime_plan)
-        else:
-            runtime_plan.unlink(missing_ok=True)
+    plan_restore_error = restore_pending_plan() if external_plan else None
 
     state = parse_state(selected_state) if selected_state else {}
     review_id = state.get("review_id")
@@ -612,6 +657,8 @@ def main() -> int:
     evidence_state: Path | None = None
     evidence_review_dir: Path | None = None
     copy_errors: list[str] = []
+    if plan_restore_error:
+        copy_errors.append(f"repository PLAN.md restoration failed: {plan_restore_error}")
     if state_identity_valid:
         findings_dir = state_dir / str(review_id)
 
@@ -657,7 +704,15 @@ def main() -> int:
         outcome = "degraded"
         reason = "required adapter evidence could not be copied: " + "; ".join(copy_errors)
     elif args.engine == "sweep-v2":
-        sweep = validate_sweep(selected_state, findings_dir, runtime_plan, evidence / "PLAN.after.md", args.rounds)
+        sweep = validate_sweep(
+            evidence_state,
+            evidence_review_dir,
+            findings_dir,
+            runtime_plan,
+            evidence / "PLAN.after.md",
+            args.rounds,
+            args.topic.strip(),
+        )
         state = sweep["state"]
         phase = state.get("phase")
         decision = state.get("decision_signal")
@@ -736,4 +791,8 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as exc:
-        sys.exit(fail(f"unexpected adapter failure: {type(exc).__name__}: {exc}", kind="internal"))
+        restore_error = restore_pending_plan()
+        message = f"unexpected adapter failure: {type(exc).__name__}: {exc}"
+        if restore_error:
+            message += f"; repository PLAN.md restoration also failed: {restore_error}"
+        sys.exit(fail(message, kind="internal"))

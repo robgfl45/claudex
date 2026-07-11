@@ -41,7 +41,7 @@ After the child returns:
 3. Read copied `evidence_state_file`, `generation_manifest`, `consolidated_findings`, and every persona finding/sidecar under `generation_evidence_dir`. `state_file` and `final_findings` retain legacy source-path semantics; do not rely on them after cleanup.
 4. Read `<PLAN>` again and compare it with the grounded scope and reported snapshot hash.
 5. Check outcome invariants:
-   - `converged`: exit 0 and `clean=true`; state is done/converged/clean/coverage-complete; exactly the five required personas have readable clean evidence tied to one hash; snapshot and converged hashes match; manifest and consolidated hashes validate; consolidated findings prove all five are clean.
+   - `converged`: exit 0 and `clean=true`; state is done/converged/clean/coverage-complete; exactly the five required personas have readable clean evidence tied to one hash; snapshot and converged hashes match; manifest schema/content/snapshot chain validate; consolidated and aggregate persona-evidence hashes match state; consolidated findings prove all five are clean.
    - `max_reached`: exit 10 and `clean=false`; the capped generation has complete same-snapshot coverage and material findings. At the standard cap this is generation five.
    - `degraded`: exit 11 and `clean=false`; missing, malformed, mutated, hash-mismatched, cancelled, or incomplete state/evidence.
    - `failed`: exit 12 and `clean=false`.

@@ -74,7 +74,7 @@ else:
     personas = ['architecture-scope','security-data','product-domain','quality-accessibility-performance','operations-deployment']
     match = re.search(r'--rounds (\d+)', prompt)
     maximum = int(match.group(1)) if match else 5
-    generation = 5 if outcome == 'sweep_max' else 1
+    generation = 5 if outcome == 'sweep_max' else (2 if outcome == 'sweep_broken_chain' else 1)
     generation_dir = review_dir / 'generations' / str(generation)
     generation_dir.mkdir(parents=True)
     snapshot = generation_dir / 'PLAN.md'
@@ -82,18 +82,41 @@ else:
     snapshot_hash = hashlib.sha256(snapshot.read_bytes()).hexdigest()
     previous_hash = None
     if generation > 1:
-        previous_dir = review_dir / 'generations' / str(generation - 1)
-        previous_dir.mkdir(parents=True)
-        (previous_dir / 'manifest.json').write_text(json.dumps({'snapshot_sha256': snapshot_hash}))
-        previous_hash = snapshot_hash
-    manifest_topic = 'different topic' if outcome == 'sweep_topic_mismatch' else 'test'
+        for previous_generation in range(1, generation):
+            previous_dir = review_dir / 'generations' / str(previous_generation)
+            previous_dir.mkdir(parents=True)
+            previous_snapshot = previous_dir / 'PLAN.md'
+            previous_snapshot.write_text(f'# Prior plan generation {previous_generation}\n')
+            current_previous_hash = hashlib.sha256(previous_snapshot.read_bytes()).hexdigest()
+            previous_manifest = {
+                'generation': previous_generation,
+                'snapshot_sha256': current_previous_hash,
+                'required_persona_ids': personas,
+                'topic': 'review the grounded plan',
+                'source_plan_path': str(pathlib.Path.cwd().resolve() / 'PLAN.md'),
+                'previous_generation_sha256': previous_hash,
+            }
+            (previous_dir / 'manifest.json').write_text(json.dumps(previous_manifest, indent=2, sort_keys=True) + '\n')
+            previous_hash = current_previous_hash
+    manifest_topic = 'different topic' if outcome == 'sweep_topic_mismatch' else 'review the grounded plan'
     manifest = {
         'generation': generation, 'snapshot_sha256': snapshot_hash,
         'required_persona_ids': personas, 'topic': manifest_topic,
         'source_plan_path': str(pathlib.Path.cwd().resolve() / 'PLAN.md'),
-        'previous_generation_sha256': previous_hash,
+        'previous_generation_sha256': ('0' * 64 if outcome == 'sweep_broken_chain' else previous_hash),
     }
     (generation_dir / 'manifest.json').write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
+    if outcome == 'sweep_empty_manifest':
+        (generation_dir / 'manifest.json').write_text('{}\n')
+    elif outcome == 'sweep_missing_manifest':
+        (generation_dir / 'manifest.json').unlink()
+    elif outcome == 'sweep_wrong_type_manifest':
+        (generation_dir / 'manifest.json').write_text('[]\n')
+    elif outcome == 'sweep_malformed_manifest':
+        (generation_dir / 'manifest.json').write_text('{not-json\n')
+    elif outcome == 'sweep_schema_manifest':
+        manifest['unexpected'] = True
+        (generation_dir / 'manifest.json').write_text(json.dumps(manifest) + '\n')
     chunks = [f'# Consolidated findings — generation {generation}\n\n', f'Snapshot SHA-256: `{snapshot_hash}`\n\n']
     evidence = hashlib.sha256()
     for persona in personas:
@@ -114,7 +137,7 @@ else:
         data = {
             'persona_id': persona, 'expected_snapshot_sha256': expected,
             'actual_snapshot_sha256_before': snapshot_hash,
-            'actual_snapshot_sha256_after': snapshot_hash, 'codex_exit_code': 0,
+            'actual_snapshot_sha256_after': snapshot_hash, 'codex_exit_code': (1 if outcome == 'sweep_nonzero_sidecar' and persona == 'security-data' else 0),
             'findings_path': str(findings), 'findings_sha256': findings_hash,
             'findings_classification': classification,
             'completed_at': '2099-01-01T00:00:00Z',
@@ -129,18 +152,27 @@ else:
             evidence.update(artifact.name.encode() + b'\0')
             evidence.update(artifact.read_bytes())
             evidence.update(b'\0')
+    if outcome == 'sweep_findings_mutated':
+        target = generation_dir / 'architecture-scope.findings.md'
+        target.write_text(target.read_text() + 'mutated after sidecar\n')
     if outcome == 'sweep_missing':
         (generation_dir / 'operations-deployment.result.json').unlink()
     consolidated = generation_dir / 'consolidated-findings.md'
     consolidated.write_text(''.join(chunks))
     if outcome == 'sweep_mutated_consolidated':
         consolidated.write_text(consolidated.read_text() + 'Claude says this is still clean.\n')
+    if outcome == 'sweep_live_plan_mutated':
+        (pathlib.Path.cwd() / 'PLAN.md').write_text('# Mutated live plan\n')
     signal = 'max-reached' if outcome == 'sweep_max' else ('cancelled' if outcome == 'sweep_cancelled' else ('degraded' if outcome == 'sweep_degraded' else 'converged'))
     phase = 'cancelled' if outcome == 'sweep_cancelled' else 'done'
     clean = 'false' if outcome in {'sweep_max', 'sweep_cancelled', 'sweep_degraded'} else 'true'
     converged_hash = '' if outcome in {'sweep_max', 'sweep_cancelled', 'sweep_degraded'} else snapshot_hash
     state_review_id = '20990101-000000-deadbe' if outcome == 'sweep_review_id_mismatch' else rid
-    state_path.write_text(f'''mode: plan\nphase: {phase}\ntopic: test\nround: {generation}\nmax_rounds: {maximum}\nreview_id: {state_review_id}\nrepo_root: {pathlib.Path.cwd().resolve()}\ndecision_signal: {signal}\nengine: sweep-v2\ngeneration: {generation}\nmax_generations: {maximum}\nsnapshot_sha256: {snapshot_hash}\ncoverage_complete: true\nclean: {clean}\nrevision_required: false\nreviewed_live_sha256: {snapshot_hash}\nevidence_sha256: {evidence.hexdigest()}\nconsolidated_sha256: {hashlib.sha256(consolidated.read_bytes()).hexdigest()}\nconverged_snapshot_sha256: {converged_hash}\n''')
+    state_mode = 'review' if outcome == 'sweep_mode_mismatch' else 'plan'
+    state_topic = 'different requested topic' if outcome == 'sweep_state_topic_mismatch' else 'review the grounded plan'
+    state_repo_root = str(pathlib.Path.cwd().resolve() / 'other') if outcome == 'sweep_repo_mismatch' else str(pathlib.Path.cwd().resolve())
+    state_evidence_hash = '0' * 64 if outcome == 'sweep_evidence_digest_mismatch' else evidence.hexdigest()
+    state_path.write_text(f'''mode: {state_mode}\nphase: {phase}\ntopic: {state_topic}\nround: {generation}\nmax_rounds: {maximum}\nreview_id: {state_review_id}\nrepo_root: {state_repo_root}\ndecision_signal: {signal}\nengine: sweep-v2\ngeneration: {generation}\nmax_generations: {maximum}\nsnapshot_sha256: {snapshot_hash}\ncoverage_complete: true\nclean: {clean}\nrevision_required: false\nreviewed_live_sha256: {snapshot_hash}\nevidence_sha256: {state_evidence_hash}\nconsolidated_sha256: {hashlib.sha256(consolidated.read_bytes()).hexdigest()}\nconverged_snapshot_sha256: {converged_hash}\n''')
 print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01, 'session_id': 'fake-session'}))
 """)
 
@@ -151,13 +183,14 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         path.write_text(textwrap.dedent(content))
         path.chmod(0o755)
 
-    def run_adapter(self, outcome="sweep_clean", timeout="5", extra_env=None, engine="sweep-v2", rounds="1"):
+    def run_adapter(self, outcome="sweep_clean", timeout="5", extra_env=None, engine="sweep-v2", rounds="1", plan=None):
         env = os.environ.copy()
         env["FAKE_CLAUDE_OUTCOME"] = outcome
         if extra_env:
             env.update(extra_env)
+        plan_path = Path(plan) if plan is not None else self.plan
         command = [
-            str(ADAPTER), "--repo", str(self.repo.resolve()), "--plan", str(self.plan.resolve()),
+            str(ADAPTER), "--repo", str(self.repo.resolve()), "--plan", str(plan_path.resolve()),
             "--topic", "review the grounded plan", "--rounds", rounds, "--timeout", timeout,
             "--budget-usd", "1.25", "--plugin-root", str(PLUGIN.resolve()),
             "--claude", str(self.claude.resolve()), "--codex", str(self.codex.resolve()),
@@ -183,6 +216,11 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         for key in ("evidence_state_file", "generation_manifest", "generation_evidence_dir", "consolidated_findings"):
             self.assertTrue(Path(result[key]).exists(), key)
             self.assertTrue(str(Path(result[key])).startswith(result["evidence_dir"]))
+        self.assertEqual(Path(result["source_state_file"]).read_bytes(), Path(result["evidence_state_file"]).read_bytes())
+        source_generation = self.repo / ".claude" / "claudex" / result["review_id"] / "generations" / str(result["generation"])
+        copied_generation = Path(result["generation_evidence_dir"])
+        for artifact in ["PLAN.md", "manifest.json", "consolidated-findings.md"] + [f"{persona}.{suffix}" for persona in PERSONAS for suffix in ("findings.md", "result.json")]:
+            self.assertEqual((source_generation / artifact).read_bytes(), (copied_generation / artifact).read_bytes(), artifact)
 
     def test_generation_five_material_findings_are_max_reached(self):
         completed, result = self.run_adapter("sweep_max", rounds="5")
@@ -210,17 +248,58 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         self.assertFalse(result["clean"])
         self.assertIn("hash-mismatched", result["reason"])
 
+    def test_additional_evidence_integrity_failures_cannot_be_clean(self):
+        fixtures = (
+            "sweep_findings_mutated",
+            "sweep_nonzero_sidecar",
+            "sweep_evidence_digest_mismatch",
+            "sweep_live_plan_mutated",
+        )
+        for fixture in fixtures:
+            with self.subTest(fixture=fixture):
+                completed, result = self.run_adapter(fixture)
+                self.assertEqual(completed.returncode, 11)
+                self.assertFalse(result["clean"])
+
     def test_state_filename_and_review_id_must_match(self):
         completed, result = self.run_adapter("sweep_review_id_mismatch")
         self.assertEqual(completed.returncode, 11)
         self.assertFalse(result["clean"])
         self.assertIn("filename and review_id", result["reason"])
 
+    def test_state_scope_identity_must_match_request(self):
+        for fixture in ("sweep_mode_mismatch", "sweep_repo_mismatch", "sweep_state_topic_mismatch"):
+            with self.subTest(fixture=fixture):
+                completed, result = self.run_adapter(fixture)
+                self.assertEqual(completed.returncode, 11)
+                self.assertFalse(result["clean"])
+
     def test_manifest_topic_must_match_state(self):
         completed, result = self.run_adapter("sweep_topic_mismatch")
         self.assertEqual(completed.returncode, 11)
         self.assertFalse(result["clean"])
         self.assertIn("manifest topic does not match state", result["reason"])
+
+    def test_invalid_manifest_shapes_cannot_be_clean(self):
+        fixtures = (
+            "sweep_empty_manifest",
+            "sweep_missing_manifest",
+            "sweep_wrong_type_manifest",
+            "sweep_malformed_manifest",
+            "sweep_schema_manifest",
+        )
+        for fixture in fixtures:
+            with self.subTest(fixture=fixture):
+                completed, result = self.run_adapter(fixture)
+                self.assertEqual(completed.returncode, 11)
+                self.assertFalse(result["clean"])
+                self.assertIn("manifest", result["reason"])
+
+    def test_broken_generation_chain_cannot_be_clean(self):
+        completed, result = self.run_adapter("sweep_broken_chain", rounds="2")
+        self.assertEqual(completed.returncode, 11)
+        self.assertFalse(result["clean"])
+        self.assertIn("manifest/snapshot chain is invalid", result["reason"])
 
     def test_mutated_consolidated_findings_cannot_be_clean(self):
         completed, result = self.run_adapter("sweep_mutated_consolidated")
@@ -250,6 +329,12 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         self.assertEqual(completed.returncode, 11)
         self.assertFalse(result["clean"])
 
+    def test_legacy_max_reached_remains_compatible(self):
+        completed, result = self.run_adapter("legacy_max", engine="legacy")
+        self.assertEqual(completed.returncode, 10)
+        self.assertEqual(result["outcome"], "max_reached")
+        self.assertFalse(result["clean"])
+
     def test_nonzero_claude_is_failed(self):
         completed, result = self.run_adapter("failed")
         self.assertEqual(completed.returncode, 12)
@@ -264,6 +349,18 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         pid = int(marker.read_text())
         probe = subprocess.run(["kill", "-0", str(pid)], capture_output=True)
         self.assertNotEqual(probe.returncode, 0, f"child process {pid} survived timeout")
+
+    def test_external_plan_is_staged_and_repository_plan_is_restored(self):
+        original_repo_plan = "# Repository plan\n\nKeep this intact.\n"
+        external_content = "# External plan\n\nReview this safely.\n"
+        self.plan.write_text(original_repo_plan)
+        external_plan = self.base / "external-PLAN.md"
+        external_plan.write_text(external_content)
+        completed, result = self.run_adapter(plan=external_plan)
+        self.assertEqual(completed.returncode, 0)
+        self.assertTrue(result["clean"])
+        self.assertEqual(self.plan.read_text(), original_repo_plan)
+        self.assertEqual(external_plan.read_text(), external_content)
 
     def test_second_consecutive_run_uses_new_state(self):
         first, result1 = self.run_adapter()

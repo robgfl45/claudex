@@ -33,7 +33,7 @@ A clean result requires all of the following from authoritative state and artifa
 - terminal `phase=done`, `decision_signal=converged`, `clean=true`, and `coverage_complete=true`;
 - exactly the five required personas—architecture/scope, security/data, product/domain, quality/accessibility/performance, and operations/deployment;
 - every persona result tied to the same immutable generation snapshot SHA-256, with readable, schema-valid sidecars and findings;
-- a readable generation manifest and consolidated findings whose hashes match state; and
+- a readable generation manifest whose schema, content, snapshot bytes, and generation linkage validate, plus consolidated findings and aggregate persona evidence whose hashes match state; and
 - consolidated findings proving that all five personas returned exactly no substantive findings.
 
 Generation five with material findings is `max_reached` and non-clean. Missing, malformed, mutated, hash-mismatched, nonzero, cancelled, degraded, or incomplete evidence is never clean.
