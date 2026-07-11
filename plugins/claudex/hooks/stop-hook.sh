@@ -242,8 +242,17 @@ Do not edit the snapshot or live \`PLAN.md\` while it runs. When it finishes, en
       if [ -z "$CURRENT_LIVE_SHA" ] || [ "$CURRENT_LIVE_SHA" = "$SNAPSHOT_SHA" ]; then
         block "Sweep-v2 found material issues in generation $GENERATION. Read \`$CONSOLIDATED\`, revise live \`PLAN.md\` exactly once, and add or update \`## Changelog\` recording each accepted or rejected item with reasons. Do not modify the frozen snapshot. Then end your turn."
       fi
-      if ! grep -qE '^## Changelog[[:space:]]*$' PLAN.md 2>/dev/null; then
-        block "The required plan revision exists, but \`PLAN.md\` has no \`## Changelog\`. Record accepted and rejected consolidated findings with reasons, then end your turn."
+      if ! claudex_sweep_validate_reconciliation PLAN.md "$CONSOLIDATED" "$GENERATION" "$SNAPSHOT_SHA"; then
+        block "The required plan revision exists, but its \`## Changelog\` does not reconcile every generation-$GENERATION finding. Add this exact heading under \`## Changelog\`:
+
+\`### Sweep generation $GENERATION — $SNAPSHOT_SHA\`
+
+Then add exactly one disposition for every ID in \`$CONSOLIDATED\` using:
+
+\`- Accepted [finding-id]: reason and resulting plan change\`
+\`- Rejected [finding-id]: grounded reason\`
+
+Do not advance until every material finding ID has one reasoned disposition."
       fi
       NEW_GENERATION=$((GENERATION + 1))
       if [ "$NEW_GENERATION" -gt "$MAX_GENERATIONS" ] || [ "$NEW_GENERATION" -gt 5 ]; then
@@ -284,13 +293,40 @@ When the runner finishes, end your turn."
 
     summarizing)
       # Revalidate every current-generation artifact at summary time so a
-      # post-run mutation cannot ride a previously clean state signal.
+      # post-run mutation cannot ride a previously clean state signal. Clear
+      # the prior verdict first so an I/O/consolidation failure fails closed.
+      if ! claudex_state_set_field "$ACTIVE_STATE" decision_signal degraded \
+        || ! claudex_state_set_field "$ACTIVE_STATE" clean false \
+        || ! claudex_state_set_field "$ACTIVE_STATE" coverage_complete false; then
+        block "Sweep-v2 could not persist its fail-closed revalidation state. No clean result is claimed; repair the state directory and retry or cancel."
+      fi
       claudex_sweep_consolidate "$ACTIVE_STATE" "$REVIEW_ID" "$GENERATION" "$SNAPSHOT_SHA" "$SNAPSHOT_SHA" >/dev/null 2>&1
+      REVALIDATE_RC=$?
+      case "$REVALIDATE_RC" in
+        0|2|3) ;;
+        *)
+          if ! claudex_state_set_field "$ACTIVE_STATE" decision_signal degraded \
+            || ! claudex_state_set_field "$ACTIVE_STATE" clean false \
+            || ! claudex_state_set_field "$ACTIVE_STATE" coverage_complete false \
+            || ! claudex_state_set_field "$ACTIVE_STATE" phase summarizing; then
+            block "Sweep-v2 revalidation failed and its degraded verdict could not be persisted. No clean result is claimed."
+          fi
+          ;;
+      esac
       SIGNAL=$(claudex_state_read_field "$ACTIVE_STATE" decision_signal)
       CLEAN=$(claudex_state_read_field "$ACTIVE_STATE" clean)
+      COVERAGE_COMPLETE=$(claudex_state_read_field "$ACTIVE_STATE" coverage_complete)
+      if [ "$SIGNAL" = "converged" ] && { [ "$REVALIDATE_RC" -ne 0 ] || [ "$CLEAN" != "true" ] || [ "$COVERAGE_COMPLETE" != "true" ]; }; then
+        claudex_state_set_field "$ACTIVE_STATE" decision_signal degraded
+        claudex_state_set_field "$ACTIVE_STATE" clean false
+        claudex_state_set_field "$ACTIVE_STATE" coverage_complete false
+        SIGNAL=degraded
+        CLEAN=false
+        COVERAGE_COMPLETE=false
+      fi
       CONVERGED_SHA=$(claudex_state_read_field "$ACTIVE_STATE" converged_snapshot_sha256)
       claudex_state_set_field "$ACTIVE_STATE" phase done
-      rm -f "$RUNNER" "$STATE_DIR/$REVIEW_ID-prompt.txt" "$STATE_DIR/$REVIEW_ID.lock" 2>/dev/null
+      rm -f "$RUNNER" "$STATE_DIR/$REVIEW_ID-prompt.txt" "$STATE_DIR/$REVIEW_ID.lock" "$STATE_DIR/$REVIEW_ID-active-pgid" 2>/dev/null
       case "$SIGNAL" in
         converged)
           block "### Claudex sweep-v2 complete ✓
@@ -328,7 +364,7 @@ Print this summary to the user, then end your turn."
       ;;
 
     done)
-      rm -f "$RUNNER" "$STATE_DIR/$REVIEW_ID-prompt.txt" "$STATE_DIR/$REVIEW_ID.lock" 2>/dev/null
+      rm -f "$RUNNER" "$STATE_DIR/$REVIEW_ID-prompt.txt" "$STATE_DIR/$REVIEW_ID.lock" "$STATE_DIR/$REVIEW_ID-active-pgid" 2>/dev/null
       approve "sweep-v2 loop done"
       ;;
 
@@ -609,7 +645,7 @@ Findings summary will be written to:
       # Summary BLOCK was delivered on the previous fire and Claude has
       # printed it to the user. Final cleanup and approve.
       claudex_phase_transition "$ACTIVE_STATE" "summarizing" "done" 2>/dev/null
-      rm -f "$RUNNER" "$STATE_DIR/$REVIEW_ID-prompt.txt" "$STATE_DIR/$REVIEW_ID.lock" 2>/dev/null
+      rm -f "$RUNNER" "$STATE_DIR/$REVIEW_ID-prompt.txt" "$STATE_DIR/$REVIEW_ID.lock" "$STATE_DIR/$REVIEW_ID-active-pgid" 2>/dev/null
       ELAPSED=$(format_elapsed "$STARTED_AT_EPOCH")
       if [ -n "$ELAPSED" ]; then
         log "Plan loop $REVIEW_ID summary delivered; total elapsed $ELAPSED"
@@ -618,7 +654,7 @@ Findings summary will be written to:
       ;;
 
     done)
-      rm -f "$RUNNER" "$STATE_DIR/$REVIEW_ID-prompt.txt" "$STATE_DIR/$REVIEW_ID.lock" 2>/dev/null
+      rm -f "$RUNNER" "$STATE_DIR/$REVIEW_ID-prompt.txt" "$STATE_DIR/$REVIEW_ID.lock" "$STATE_DIR/$REVIEW_ID-active-pgid" 2>/dev/null
       approve "plan loop already done"
       ;;
 
@@ -680,7 +716,7 @@ After Codex finishes, end your turn. The hook will allow exit."
       ;;
 
     done)
-      rm -f "$RUNNER" "$STATE_DIR/$REVIEW_ID-prompt.txt" "$STATE_DIR/$REVIEW_ID.lock" 2>/dev/null
+      rm -f "$RUNNER" "$STATE_DIR/$REVIEW_ID-prompt.txt" "$STATE_DIR/$REVIEW_ID.lock" "$STATE_DIR/$REVIEW_ID-active-pgid" 2>/dev/null
       approve "review loop done"
       ;;
 

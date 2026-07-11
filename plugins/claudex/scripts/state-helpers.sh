@@ -20,6 +20,7 @@
 
 CLAUDEX_STATE_DIR="${CLAUDEX_STATE_DIR:-.claude/claudex}"
 CLAUDEX_STALE_MINUTES="${CLAUDEX_STALE_MINUTES:-15}"
+CLAUDEX_SWEEP_V2_STALE_MINUTES="${CLAUDEX_SWEEP_V2_STALE_MINUTES:-120}"
 
 claudex_new_review_id() {
   local ts
@@ -131,13 +132,23 @@ claudex_lock_is_active() {
 
 claudex_sweep_stale() {
   [ -d "$CLAUDEX_STATE_DIR" ] || return 0
-  # Find state files older than threshold; remove their state, lock, runner,
-  # prompt, and per-review findings dir.
+  # Never reap a loop whose current runner still owns the lock. sweep-v2 gets
+  # a longer stale window because one generation runs five reviewers and can
+  # legitimately exceed the legacy 15-minute threshold.
   find "$CLAUDEX_STATE_DIR" -maxdepth 1 -type f -name "*.state" -mmin "+$CLAUDEX_STALE_MINUTES" 2>/dev/null \
   | while read -r f; do
     local id
     id=$(basename "$f" .state)
-    rm -f "$f" "$CLAUDEX_STATE_DIR/${id}.lock" "$CLAUDEX_STATE_DIR/${id}-runner.sh" "$CLAUDEX_STATE_DIR/${id}-prompt.txt" 2>/dev/null
+    local lock="$CLAUDEX_STATE_DIR/${id}.lock"
+    if claudex_lock_is_active "$lock"; then
+      continue
+    fi
+    local engine
+    engine=$(claudex_state_read_field "$f" engine)
+    if [ "$engine" = "sweep-v2" ] && ! find "$f" -prune -mmin "+$CLAUDEX_SWEEP_V2_STALE_MINUTES" -print 2>/dev/null | grep -q .; then
+      continue
+    fi
+    rm -f "$f" "$CLAUDEX_STATE_DIR/${id}.lock" "$CLAUDEX_STATE_DIR/${id}-runner.sh" "$CLAUDEX_STATE_DIR/${id}-prompt.txt" "$CLAUDEX_STATE_DIR/${id}-active-pgid" 2>/dev/null
     rm -rf "$CLAUDEX_STATE_DIR/${id}" 2>/dev/null
   done
   return 0

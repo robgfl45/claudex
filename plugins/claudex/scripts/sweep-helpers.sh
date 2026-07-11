@@ -3,6 +3,7 @@
 # shellcheck shell=bash
 
 CLAUDEX_SWEEP_MAX_GENERATIONS=5
+CLAUDEX_SWEEP_PERSONA_TIMEOUT_SECONDS="${CLAUDEX_SWEEP_PERSONA_TIMEOUT_SECONDS:-300}"
 
 claudex_sha256() {
   local file="$1"
@@ -43,6 +44,53 @@ for i, start in enumerate(positions):
 if material == 0 or lines[:positions[0]]:
     print("malformed"); raise SystemExit(1)
 print("material")
+PY
+}
+
+claudex_sweep_render_findings_with_ids() {
+  local file="$1" persona="$2"
+  python3 - "$file" "$persona" <<'PY'
+import pathlib, sys
+
+path, persona = sys.argv[1:]
+severity = None
+counts = {"high": 0, "medium": 0, "low": 0}
+for line in pathlib.Path(path).read_text(encoding="utf-8").splitlines():
+    if line in {"## High", "## Medium", "## Low"}:
+        severity = line[3:].lower()
+        print(line)
+    elif line.startswith("- ") and severity:
+        counts[severity] += 1
+        finding_id = f"{persona}-{severity}-{counts[severity]}"
+        print(f"- [{finding_id}] {line[2:]}")
+    else:
+        print(line)
+PY
+}
+
+claudex_sweep_validate_reconciliation() {
+  local plan="$1" consolidated="$2" generation="$3" snapshot_sha="$4"
+  python3 - "$plan" "$consolidated" "$generation" "$snapshot_sha" <<'PY'
+import pathlib, re, sys
+
+plan_path, consolidated_path, generation, snapshot_sha = sys.argv[1:]
+plan = pathlib.Path(plan_path).read_text(encoding="utf-8")
+consolidated = pathlib.Path(consolidated_path).read_text(encoding="utf-8")
+ids = re.findall(r"^- \[([a-z0-9-]+-(?:high|medium|low)-[0-9]+)\] ", consolidated, re.M)
+if not ids or len(ids) != len(set(ids)):
+    raise SystemExit(1)
+match = re.search(r"^## Changelog\s*$([\s\S]*?)(?=^## |\Z)", plan, re.M)
+if not match:
+    raise SystemExit(1)
+section = match.group(1)
+heading = f"### Sweep generation {generation} — {snapshot_sha}"
+if heading not in section:
+    raise SystemExit(1)
+for finding_id in ids:
+    pattern = rf"^- (?:Accepted|Rejected) \[{re.escape(finding_id)}\]:\s+\S.+$"
+    if len(re.findall(pattern, section, re.M)) != 1:
+        raise SystemExit(1)
+raise SystemExit(0)
 PY
 }
 
@@ -95,10 +143,12 @@ PY
 
 claudex_sweep_write_result() {
   local result_file="$1" persona="$2" expected="$3" before="$4" after="$5" rc="$6" findings="$7" classification="$8"
+  local findings_sha=""
+  findings_sha=$(claudex_sha256 "$findings" 2>/dev/null) || findings_sha=""
   local tmp="${result_file}.tmp.$$"
-  python3 - "$tmp" "$persona" "$expected" "$before" "$after" "$rc" "$findings" "$classification" <<'PY'
+  python3 - "$tmp" "$persona" "$expected" "$before" "$after" "$rc" "$findings" "$classification" "$findings_sha" <<'PY'
 import datetime, json, pathlib, sys
-path, persona, expected, before, after, rc, findings, classification = sys.argv[1:]
+path, persona, expected, before, after, rc, findings, classification, findings_sha = sys.argv[1:]
 data = {
     "persona_id": persona,
     "expected_snapshot_sha256": expected,
@@ -106,13 +156,15 @@ data = {
     "actual_snapshot_sha256_after": after,
     "codex_exit_code": int(rc),
     "findings_path": findings,
+    "findings_sha256": findings_sha,
     "findings_classification": classification,
     "completed_at": datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
 }
 pathlib.Path(path).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
   [ $? -eq 0 ] || { rm -f "$tmp"; return 1; }
-  mv "$tmp" "$result_file"
+  mv "$tmp" "$result_file" || return 1
+  chmod a-w "$findings" "$result_file" 2>/dev/null || true
 }
 
 claudex_sweep_consolidate() {
@@ -163,15 +215,17 @@ PY
         continue
       fi
       valid=$(python3 - "$result" "$persona" "$expected" "$findings" <<'PY'
-import datetime, json, pathlib, sys
+import datetime, hashlib, json, pathlib, sys
 path, persona, expected, findings = sys.argv[1:]
 try:
     data = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
-    required = {"persona_id", "expected_snapshot_sha256", "actual_snapshot_sha256_before", "actual_snapshot_sha256_after", "codex_exit_code", "findings_path", "findings_classification", "completed_at"}
+    required = {"persona_id", "expected_snapshot_sha256", "actual_snapshot_sha256_before", "actual_snapshot_sha256_after", "codex_exit_code", "findings_path", "findings_sha256", "findings_classification", "completed_at"}
     ok = set(data) == required
     ok &= data["persona_id"] == persona and data["expected_snapshot_sha256"] == expected
     ok &= data["actual_snapshot_sha256_before"] == expected and data["actual_snapshot_sha256_after"] == expected
     ok &= data["codex_exit_code"] == 0 and data["findings_path"] == findings
+    actual_findings_sha = hashlib.sha256(pathlib.Path(findings).read_bytes()).hexdigest()
+    ok &= data["findings_sha256"] == actual_findings_sha
     ok &= data["findings_classification"] in {"clean", "material"}
     datetime.datetime.strptime(data["completed_at"], "%Y-%m-%dT%H:%M:%SZ")
     print(data["findings_classification"] if ok else "degraded")
@@ -184,9 +238,14 @@ PY
         printf 'DEGRADED: invalid sidecar, hash, exit status, or findings schema.\n\n'
         degraded=true
       else
-        cat "$findings"
+        if [ "$classification" = "clean" ]; then
+          cat "$findings"
+          clean_count=$((clean_count + 1))
+        else
+          claudex_sweep_render_findings_with_ids "$findings" "$persona" || degraded=true
+          material=true
+        fi
         printf '\n\n'
-        if [ "$classification" = "clean" ]; then clean_count=$((clean_count + 1)); else material=true; fi
       fi
     done
   } > "$tmp" || { rm -f "$tmp"; return 1; }
@@ -248,11 +307,62 @@ EXPECTED=$(printf '%q' "$expected")
 LIVE_EXPECTED=$(printf '%q' "$live_expected")
 GENERATION_DIR=$(printf '%q' "$generation_dir")
 SNAPSHOT=$(printf '%q' "$snapshot")
+PERSONA_TIMEOUT=$(printf '%q' "$CLAUDEX_SWEEP_PERSONA_TIMEOUT_SECONDS")
+ACTIVE_PGID_FILE=$(printf '%q' "$CLAUDEX_STATE_DIR/$review_id-active-pgid")
 source "\$CLAUDE_PLUGIN_ROOT/scripts/state-helpers.sh"
 source "\$CLAUDE_PLUGIN_ROOT/scripts/personas.sh"
 source "\$CLAUDE_PLUGIN_ROOT/scripts/sweep-helpers.sh"
 CODEX_BIN="\${CLAUDEX_CODEX_BIN:-codex}"
+claudex_run_codex_bounded() {
+  python3 - "\$CODEX_BIN" "\$1" "\$PERSONA_TIMEOUT" "\$ACTIVE_PGID_FILE" <<'PY'
+import os, pathlib, signal, subprocess, sys
+
+codex_bin, prompt_path, timeout_raw, active_pgid_path = sys.argv[1:]
+try:
+    timeout = int(timeout_raw)
+    if timeout < 1:
+        raise ValueError
+except ValueError:
+    raise SystemExit(125)
+
+with open(prompt_path, "rb") as prompt:
+    process = subprocess.Popen(
+        [codex_bin, "exec", "--dangerously-bypass-approvals-and-sandbox"],
+        stdin=prompt,
+        start_new_session=True,
+    )
+pgid_path = pathlib.Path(active_pgid_path)
+pgid_path.write_text(str(process.pid) + "\n", encoding="utf-8")
+exit_code = 125
+try:
+    try:
+        exit_code = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+        exit_code = 124
+finally:
+    try:
+        if pgid_path.read_text(encoding="utf-8").strip() == str(process.pid):
+            pgid_path.unlink()
+    except FileNotFoundError:
+        pass
+raise SystemExit(exit_code)
+PY
+}
+claudex_lock_write "\$CLAUDEX_STATE_DIR/\$REVIEW_ID.lock"
 for persona in \$CLAUDEX_SWEEP_PERSONAS; do
+  [ "\$(claudex_state_read_field "\$STATE_FILE" phase)" = cancelled ] && break
   findings="\$GENERATION_DIR/\$persona.findings.md"
   result="\$GENERATION_DIR/\$persona.result.json"
   prompt="\$GENERATION_DIR/.\$persona.prompt.txt"
@@ -279,7 +389,7 @@ PROMPTEOF
   elif ! command -v "\$CODEX_BIN" >/dev/null 2>&1; then
     rc=127
   else
-    "\$CODEX_BIN" exec --dangerously-bypass-approvals-and-sandbox < "\$prompt"
+    claudex_run_codex_bounded "\$prompt"
     rc=\$?
   fi
   after=\$(claudex_sha256 "\$SNAPSHOT" 2>/dev/null)
@@ -290,8 +400,13 @@ PROMPTEOF
     [ "\$classification" = clean ] || [ "\$classification" = material ] || classification=degraded
   fi
   claudex_sweep_write_result "\$result" "\$persona" "\$EXPECTED" "\$before" "\$after" "\$rc" "\$findings" "\$classification"
+  claudex_state_set_field "\$STATE_FILE" sweep_heartbeat "\$persona"
   rm -f "\$prompt"
 done
+if [ "\$(claudex_state_read_field "\$STATE_FILE" phase)" = cancelled ]; then
+  rm -f "\$ACTIVE_PGID_FILE"
+  exit 130
+fi
 claudex_sweep_consolidate "\$STATE_FILE" "\$REVIEW_ID" "\$GENERATION" "\$EXPECTED" "\$LIVE_EXPECTED"
 rc=\$?
 case "\$rc" in 0) echo '[claudex] sweep converged' ;; 1) echo '[claudex] material findings require revision' ;; 2) echo '[claudex] sweep degraded' ;; 3) echo '[claudex] maximum generations reached' ;; esac

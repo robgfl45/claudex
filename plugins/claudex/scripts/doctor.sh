@@ -3,7 +3,7 @@
 #
 # Verifies that everything claudex needs is wired up correctly:
 #   - bash version
-#   - python3 (for JSON escape; sed fallback exists but python3 is preferred)
+#   - python3 (required for sweep-v2 manifests and artifact validation)
 #   - codex CLI installed and responding
 #   - .claude/claudex writable
 #   - plugin file integrity (every expected script + prompt template present)
@@ -11,7 +11,6 @@
 #   - stale loops report (informational, not fatal)
 #
 # Exits 0 if every required check passes, 1 if any required check fails.
-# Optional checks (e.g. python3) only print warnings.
 
 set +e
 
@@ -82,8 +81,8 @@ if command -v codex >/dev/null 2>&1; then
   fi
 fi
 
-section "Optional dependencies"
-warn_check "python3 (used for JSON escape; sed fallback works)" command -v python3
+section "Required runtime dependencies"
+check "python3 (required for sweep-v2 manifests and validation)" command -v python3
 
 section "State directory"
 mkdir -p "$CLAUDEX_STATE_DIR" 2>/dev/null

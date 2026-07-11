@@ -56,10 +56,10 @@ CLEAN=$(claudex_state_read_field       "$ACTIVE" "clean")
 
 # Phase color.
 case "$PHASE" in
-  drafting|reviewing) PHASE_COLOR="$C_YELLOW" ;;
-  done)               PHASE_COLOR="$C_GREEN"  ;;
-  cancelled|errored)  PHASE_COLOR="$C_RED"    ;;
-  *)                  PHASE_COLOR="$C_DIM"    ;;
+  drafting|reviewing|awaiting-revision|summarizing) PHASE_COLOR="$C_YELLOW" ;;
+  done)                                             PHASE_COLOR="$C_GREEN"  ;;
+  cancelled|errored)                                PHASE_COLOR="$C_RED"    ;;
+  *)                                                PHASE_COLOR="$C_DIM"    ;;
 esac
 
 # Elapsed.
@@ -78,15 +78,15 @@ if [ -n "$STARTED_EPOCH" ]; then
   esac
 fi
 
-# Activity inferred from phase. The lock file's PID belongs to the start-loop
-# script that has long since exited, so a lock-PID-alive check is never useful
-# in claudex's between-turns architecture. Phase is the real liveness signal.
+# Activity inferred primarily from phase. sweep-v2 refreshes the lock with the
+# active runner PID while reviewers execute; between turns the phase remains
+# the authoritative lifecycle signal.
 case "$PHASE" in
-  drafting|reviewing) ACTIVITY_LINE="${C_GREEN}active${C_RESET} (loop in progress between turns)" ;;
-  done)               ACTIVITY_LINE="${C_DIM}complete${C_RESET}" ;;
-  cancelled)          ACTIVITY_LINE="${C_RED}cancelled${C_RESET}" ;;
-  errored)            ACTIVITY_LINE="${C_RED}errored${C_RESET}" ;;
-  *)                  ACTIVITY_LINE="${C_DIM}unknown${C_RESET}" ;;
+  drafting|reviewing|awaiting-revision|summarizing) ACTIVITY_LINE="${C_GREEN}active${C_RESET} (loop in progress between turns)" ;;
+  done)                                             ACTIVITY_LINE="${C_DIM}complete${C_RESET}" ;;
+  cancelled)                                        ACTIVITY_LINE="${C_RED}cancelled${C_RESET}" ;;
+  errored)                                          ACTIVITY_LINE="${C_RED}errored${C_RESET}" ;;
+  *)                                                ACTIVITY_LINE="${C_DIM}unknown${C_RESET}" ;;
 esac
 
 # Runner script.

@@ -112,6 +112,10 @@ case "$MODE" in
       exit 2
     fi
     if [ "$ENGINE" = "sweep-v2" ]; then
+      if ! command -v python3 >/dev/null 2>&1; then
+        echo "--engine sweep-v2 requires python3 for manifests and artifact validation." >&2
+        exit 2
+      fi
       if [ ! -s "PLAN.md" ]; then
         echo "--engine sweep-v2 requires an existing non-empty PLAN.md." >&2
         exit 2
