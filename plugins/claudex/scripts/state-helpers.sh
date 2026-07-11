@@ -52,7 +52,7 @@ claudex_state_read_field() {
   local field="$2"
   [ -f "$file" ] || return 1
   local value
-  value=$(grep -E "^${field}:" "$file" 2>/dev/null | head -1 | sed -E "s/^${field}: *//") || return 1
+  value=$(grep -E "^${field}:" "$file" 2>/dev/null | head -1 | sed -E "s/^${field}: *//") || value=""
   # start-loop stores user topics as a single double-quoted scalar. Return the
   # logical value so later generations receive the exact same topic as
   # generation one instead of accumulating literal quote characters.

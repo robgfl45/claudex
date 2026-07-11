@@ -103,6 +103,7 @@ round_val=$(claudex_state_read_field ".claude/claudex/test.state" round)
 check "round field readable" test "$round_val" = "1"
 topic_val=$(claudex_state_read_field ".claude/claudex/test.state" topic)
 check "quoted topic is read as its logical value" test "$topic_val" = "atomic persistence topic"
+check "missing optional field stays empty under pipefail" bash -c "set -o pipefail; source '$PLUGIN_ROOT/scripts/state-helpers.sh'; value=\$(claudex_state_read_field '.claude/claudex/test.state' engine); [ -z \"\$value\" ]"
 cd - >/dev/null
 rm -rf "$TMP"
 
