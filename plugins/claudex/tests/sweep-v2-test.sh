@@ -15,7 +15,14 @@ ok() { printf '  \033[32m✓\033[0m %s\n' "$1"; PASS=$((PASS + 1)); }
 bad() { printf '  \033[31m✗\033[0m %s\n' "$1"; FAIL=$((FAIL + 1)); FAILURES+=("$1"); }
 check() { local name="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$name"; else bad "$name"; fi; }
 field() { sed -n "s/^$2: *//p" "$1" | head -1; }
-cleanup() { local p; for p in "${TEMPS[@]}"; do chmod -R u+w "$p" 2>/dev/null; rm -rf "$p"; done; }
+cleanup() {
+  local p
+  if [ "${KEEP_SWEEP_TEMPS:-0}" = 1 ]; then
+    printf 'preserved sweep temp: %s\n' "${TEMPS[@]}" >&2
+    return
+  fi
+  for p in "${TEMPS[@]}"; do chmod -R u+w "$p" 2>/dev/null; rm -rf "$p"; done
+}
 trap cleanup EXIT
 
 make_stub() {
@@ -106,6 +113,16 @@ if [ "$NO_PY_RC" -ne 0 ] && printf '%s' "$NO_PY_OUTPUT" | grep -q 'requires pyth
   ok "sweep-v2 fails before state creation without python3"
 else
   bad "sweep-v2 fails before state creation without python3"
+fi
+NO_HASH_PATH=$(mktemp -d); TEMPS+=("$NO_HASH_PATH")
+ln -s "$(command -v dirname)" "$NO_HASH_PATH/dirname"
+ln -s "$(command -v python3)" "$NO_HASH_PATH/python3"
+NO_HASH_OUTPUT=$(PATH="$NO_HASH_PATH" /bin/bash "$START" plan --engine sweep-v2 "hash prerequisite" 2>&1)
+NO_HASH_RC=$?
+if [ "$NO_HASH_RC" -ne 0 ] && printf '%s' "$NO_HASH_OUTPUT" | grep -q 'requires shasum or sha256sum' && [ ! -d .claude ]; then
+  ok "sweep-v2 fails before state creation without SHA-256 tooling"
+else
+  bad "sweep-v2 fails before state creation without SHA-256 tooling"
 fi
 rm -rf .claude
 bash "$START" plan "legacy topic" >/dev/null 2>&1
@@ -211,6 +228,12 @@ printf '\n' >> "$MUTATED_FINDINGS"
 echo '{}' | bash "$HOOK" >/dev/null 2>&1
 check "post-run findings digest mismatch degrades before summary" test "$(field "$STATE" decision_signal)" = degraded
 
+new_repo; start_sweep
+bash "$RUNNER" >/dev/null 2>&1
+RERUN_RC=0
+bash "$RUNNER" >/dev/null 2>&1 || RERUN_RC=$?
+check "completed generation evidence is write-once" bash -c "[ '$RERUN_RC' -eq 2 ] && [ \"\$(sed -n 's/^decision_signal: *//p' '$STATE')\" = degraded ]"
+
 run_degraded_case() {
   local mode="$1" persona="$2" expected_name="$3"
   new_repo; start_sweep
@@ -273,6 +296,16 @@ echo '{}' | bash "$HOOK" >/dev/null 2>&1
 chmod u+w "$GEN_DIR"
 check "summary revalidation I/O failure clears prior convergence" bash -c "[ \"\$(sed -n 's/^decision_signal: *//p' '$STATE')\" = degraded ] && [ \"\$(sed -n 's/^clean: *//p' '$STATE')\" = false ]"
 
+new_repo; start_sweep
+bash "$RUNNER" >/dev/null 2>&1
+ATOMIC_SHA=$(field "$STATE" snapshot_sha256)
+CLAUDEX_STATE_DIR=.claude/claudex CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" /bin/bash -c 'source "$CLAUDE_PLUGIN_ROOT/scripts/state-helpers.sh"; source "$CLAUDE_PLUGIN_ROOT/scripts/personas.sh"; source "$CLAUDE_PLUGIN_ROOT/scripts/sweep-helpers.sh"; claudex_sweep_set_fields_atomic "$1" decision_signal none clean false phase reviewing' _ "$STATE"
+chmod a-w .claude/claudex
+ATOMIC_RC=0
+CLAUDEX_STATE_DIR=.claude/claudex CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" /bin/bash -c 'source "$CLAUDE_PLUGIN_ROOT/scripts/state-helpers.sh"; source "$CLAUDE_PLUGIN_ROOT/scripts/personas.sh"; source "$CLAUDE_PLUGIN_ROOT/scripts/sweep-helpers.sh"; claudex_sweep_consolidate "$1" "$2" 1 "$3" "$3" >/dev/null 2>&1' _ "$STATE" "$ID" "$ATOMIC_SHA" || ATOMIC_RC=$?
+chmod u+w .claude/claudex
+check "unpersistable verdict cannot report convergence" bash -c "[ '$ATOMIC_RC' -ne 0 ] && [ \"\$(sed -n 's/^decision_signal: *//p' '$STATE')\" != converged ] && [ \"\$(sed -n 's/^clean: *//p' '$STATE')\" = false ]"
+
 printf '\n\033[1mCoverage, generations, and isolation\033[0m\n'
 new_repo; start_sweep
 GEN_DIR=".claude/claudex/$ID/generations/1"
@@ -290,6 +323,18 @@ source "$PLUGIN_ROOT/scripts/state-helpers.sh"; source "$PLUGIN_ROOT/scripts/per
 ONLY_SHA=$(field "$STATE" snapshot_sha256)
 claudex_sweep_consolidate "$STATE" "$ID" 1 "$ONLY_SHA" "$ONLY_SHA" >/dev/null 2>&1
 check "one clean reviewer alone cannot converge" bash -c "[ \"\$(sed -n 's/^decision_signal: *//p' '$STATE')\" = degraded ] && [ \"\$(sed -n 's/^coverage_complete: *//p' '$STATE')\" = false ]"
+
+new_repo; start_sweep
+TAMPER_SHA=$(field "$STATE" snapshot_sha256)
+export CLAUDEX_SWEEP_STUB_MODE=material CLAUDEX_SWEEP_STUB_PERSONA=architecture-scope
+bash "$RUNNER" >/dev/null 2>&1
+TAMPER_CONSOLIDATED=".claude/claudex/$ID/generations/1/consolidated-findings.md"
+chmod u+w "$TAMPER_CONSOLIDATED"
+printf '\ntampered\n' >> "$TAMPER_CONSOLIDATED"
+printf '\n2. Address finding.\n\n## Changelog\n### Sweep generation 1 — %s\n- Accepted [architecture-scope-high-1]: addressed with a scoped failure-handling change.\n' "$TAMPER_SHA" >> PLAN.md
+unset CLAUDEX_SWEEP_STUB_MODE CLAUDEX_SWEEP_STUB_PERSONA
+echo '{}' | bash "$HOOK" >/dev/null 2>&1
+check "altered generation evidence cannot advance to a new snapshot" bash -c "[ \"\$(sed -n 's/^decision_signal: *//p' '$STATE')\" = degraded ] && [ \"\$(sed -n 's/^generation: *//p' '$STATE')\" = 1 ]"
 
 new_repo; start_sweep
 GEN1_SHA=$(field "$STATE" snapshot_sha256)

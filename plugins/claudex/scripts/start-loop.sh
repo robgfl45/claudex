@@ -116,6 +116,10 @@ case "$MODE" in
         echo "--engine sweep-v2 requires python3 for manifests and artifact validation." >&2
         exit 2
       fi
+      if ! command -v shasum >/dev/null 2>&1 && ! command -v sha256sum >/dev/null 2>&1; then
+        echo "--engine sweep-v2 requires shasum or sha256sum for SHA-256 verification." >&2
+        exit 2
+      fi
       if [ ! -s "PLAN.md" ]; then
         echo "--engine sweep-v2 requires an existing non-empty PLAN.md." >&2
         exit 2

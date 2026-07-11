@@ -212,7 +212,6 @@ if [ "$MODE" = "plan" ] && [ "$ENGINE" = "sweep-v2" ]; then
   GENERATION=$(claudex_state_read_field "$ACTIVE_STATE" generation)
   MAX_GENERATIONS=$(claudex_state_read_field "$ACTIVE_STATE" max_generations)
   SNAPSHOT_SHA=$(claudex_state_read_field "$ACTIVE_STATE" snapshot_sha256)
-  COVERAGE_COMPLETE=$(claudex_state_read_field "$ACTIVE_STATE" coverage_complete)
   case "$GENERATION" in ''|*[!0-9]*) GENERATION=1 ;; esac
   case "$MAX_GENERATIONS" in ''|*[!0-9]*) MAX_GENERATIONS=5 ;; esac
   [ "$MAX_GENERATIONS" -le 5 ] || MAX_GENERATIONS=5
@@ -241,6 +240,14 @@ Do not edit the snapshot or live \`PLAN.md\` while it runs. When it finishes, en
       CURRENT_LIVE_SHA=$(claudex_sha256 PLAN.md 2>/dev/null)
       if [ -z "$CURRENT_LIVE_SHA" ] || [ "$CURRENT_LIVE_SHA" = "$SNAPSHOT_SHA" ]; then
         block "Sweep-v2 found material issues in generation $GENERATION. Read \`$CONSOLIDATED\`, revise live \`PLAN.md\` exactly once, and add or update \`## Changelog\` recording each accepted or rejected item with reasons. Do not modify the frozen snapshot. Then end your turn."
+      fi
+      if claudex_sweep_consolidate "$ACTIVE_STATE" "$REVIEW_ID" "$GENERATION" "$SNAPSHOT_SHA" "$CURRENT_LIVE_SHA" >/dev/null 2>&1; then
+        RECONCILIATION_RC=0
+      else
+        RECONCILIATION_RC=$?
+      fi
+      if [ "$RECONCILIATION_RC" -ne 1 ]; then
+        block "Sweep-v2 could not revalidate generation-$GENERATION evidence before accepting the revision. The generation is degraded and cannot advance; end your turn for the terminal summary or cancel the loop."
       fi
       if ! claudex_sweep_validate_reconciliation PLAN.md "$CONSOLIDATED" "$GENERATION" "$SNAPSHOT_SHA"; then
         block "The required plan revision exists, but its \`## Changelog\` does not reconcile every generation-$GENERATION finding. Add this exact heading under \`## Changelog\`:
@@ -300,8 +307,11 @@ When the runner finishes, end your turn."
         || ! claudex_state_set_field "$ACTIVE_STATE" coverage_complete false; then
         block "Sweep-v2 could not persist its fail-closed revalidation state. No clean result is claimed; repair the state directory and retry or cancel."
       fi
-      claudex_sweep_consolidate "$ACTIVE_STATE" "$REVIEW_ID" "$GENERATION" "$SNAPSHOT_SHA" "$SNAPSHOT_SHA" >/dev/null 2>&1
-      REVALIDATE_RC=$?
+      if claudex_sweep_consolidate "$ACTIVE_STATE" "$REVIEW_ID" "$GENERATION" "$SNAPSHOT_SHA" "$SNAPSHOT_SHA" >/dev/null 2>&1; then
+        REVALIDATE_RC=0
+      else
+        REVALIDATE_RC=$?
+      fi
       case "$REVALIDATE_RC" in
         0|2|3) ;;
         *)

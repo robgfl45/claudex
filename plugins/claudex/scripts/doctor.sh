@@ -83,6 +83,7 @@ fi
 
 section "Required runtime dependencies"
 check "python3 (required for sweep-v2 manifests and validation)" command -v python3
+check "SHA-256 implementation (shasum or sha256sum)" bash -c 'command -v shasum >/dev/null 2>&1 || command -v sha256sum >/dev/null 2>&1'
 
 section "State directory"
 mkdir -p "$CLAUDEX_STATE_DIR" 2>/dev/null

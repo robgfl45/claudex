@@ -10,11 +10,72 @@ claudex_sha256() {
   [ -f "$file" ] || return 1
   if command -v shasum >/dev/null 2>&1; then
     shasum -a 256 "$file" | awk '{print $1}'
-  else
+  elif command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$file" | awk '{print $1}'
+  else
+    return 127
   fi
 }
 
+claudex_sweep_set_fields_atomic() {
+  local state_file="$1"
+  shift
+  [ $(( $# % 2 )) -eq 0 ] || return 2
+  python3 - "$state_file" "$@" <<'PY'
+import datetime, os, pathlib, re, sys, tempfile
+
+path = pathlib.Path(sys.argv[1])
+args = sys.argv[2:]
+updates = dict(zip(args[::2], args[1::2]))
+if not updates or any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) for key in updates):
+    raise SystemExit(2)
+updates.setdefault("last_updated_at", datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"))
+lines = path.read_text(encoding="utf-8").splitlines()
+seen = set()
+out = []
+for line in lines:
+    key = line.split(":", 1)[0] if ":" in line else ""
+    if key in updates:
+        out.append(f"{key}: {updates[key]}")
+        seen.add(key)
+    else:
+        out.append(line)
+for key, value in updates.items():
+    if key not in seen:
+        out.append(f"{key}: {value}")
+fd, tmp = tempfile.mkstemp(prefix=path.name + ".tmp.", dir=path.parent)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(out) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+finally:
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+PY
+}
+
+claudex_sweep_evidence_sha256() {
+  local generation_dir="$1"
+  python3 - "$generation_dir" $CLAUDEX_SWEEP_PERSONAS <<'PY'
+import hashlib, pathlib, sys
+
+root = pathlib.Path(sys.argv[1])
+digest = hashlib.sha256()
+for persona in sys.argv[2:]:
+    for suffix in ("findings.md", "result.json"):
+        path = root / f"{persona}.{suffix}"
+        if not path.is_file():
+            raise SystemExit(1)
+        digest.update(path.name.encode("utf-8") + b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+print(digest.hexdigest())
+PY
+}
 
 claudex_sweep_validate_findings() {
   local file="$1"
@@ -132,12 +193,15 @@ PY
   [ $? -eq 0 ] || { rm -f "$manifest_tmp"; return 1; }
   mv "$manifest_tmp" "$generation_dir/manifest.json" || return 1
   chmod a-w "$generation_dir/manifest.json" 2>/dev/null || true
-  claudex_state_set_field "$state_file" generation "$generation" || return 1
-  claudex_state_set_field "$state_file" snapshot_sha256 "$sha" || return 1
-  claudex_state_set_field "$state_file" coverage_complete false || return 1
-  claudex_state_set_field "$state_file" decision_signal none || return 1
-  claudex_state_set_field "$state_file" revision_required false || return 1
-  claudex_state_set_field "$state_file" reviewed_live_sha256 "$sha" || return 1
+  claudex_sweep_set_fields_atomic "$state_file" \
+    generation "$generation" \
+    snapshot_sha256 "$sha" \
+    coverage_complete false \
+    decision_signal none \
+    revision_required false \
+    reviewed_live_sha256 "$sha" \
+    evidence_sha256 "" \
+    consolidated_sha256 "" || return 1
   printf '%s' "$sha"
 }
 
@@ -176,6 +240,25 @@ claudex_sweep_consolidate() {
   current_snapshot=$(claudex_sha256 "$snapshot" 2>/dev/null)
   current_live=$(claudex_sha256 PLAN.md 2>/dev/null)
   local degraded=false material=false clean_count=0
+  local stored_evidence stored_consolidated current_evidence current_consolidated
+  stored_evidence=$(claudex_state_read_field "$state_file" evidence_sha256)
+  stored_consolidated=$(claudex_state_read_field "$state_file" consolidated_sha256)
+  if [ -n "$stored_evidence" ] || [ -n "$stored_consolidated" ]; then
+    current_evidence=$(claudex_sweep_evidence_sha256 "$generation_dir" 2>/dev/null)
+    current_consolidated=$(claudex_sha256 "$consolidated" 2>/dev/null)
+    if [ -z "$stored_evidence" ] || [ -z "$stored_consolidated" ] \
+      || [ "$current_evidence" != "$stored_evidence" ] \
+      || [ "$current_consolidated" != "$stored_consolidated" ]; then
+      claudex_sweep_set_fields_atomic "$state_file" \
+        coverage_complete false \
+        decision_signal degraded \
+        clean false \
+        revision_required false \
+        converged_snapshot_sha256 "" \
+        phase summarizing || return 4
+      return 2
+    fi
+  fi
   local manifest="$generation_dir/manifest.json"
   local manifest_valid
   manifest_valid=$(python3 - "$manifest" "$generation" "$expected" "$generation_dir" "$(pwd -P)/PLAN.md" <<'PY'
@@ -250,39 +333,62 @@ PY
     done
   } > "$tmp" || { rm -f "$tmp"; return 1; }
   mv "$tmp" "$consolidated" || return 1
+  current_evidence=$(claudex_sweep_evidence_sha256 "$generation_dir" 2>/dev/null) || degraded=true
+  current_consolidated=$(claudex_sha256 "$consolidated" 2>/dev/null) || degraded=true
+  [ -n "$current_evidence" ] && [ -n "$current_consolidated" ] || degraded=true
 
   if [ "$current_snapshot" != "$expected" ] || [ "$current_live" != "$live_expected" ]; then degraded=true; fi
   if [ "$clean_count" -ne 5 ] && [ "$material" != "true" ]; then degraded=true; fi
 
   if [ "$degraded" = "true" ]; then
-    claudex_state_set_field "$state_file" coverage_complete false
-    claudex_state_set_field "$state_file" decision_signal degraded
-    claudex_state_set_field "$state_file" clean false
-    claudex_state_set_field "$state_file" phase summarizing
+    claudex_sweep_set_fields_atomic "$state_file" \
+      coverage_complete false \
+      decision_signal degraded \
+      clean false \
+      revision_required false \
+      converged_snapshot_sha256 "" \
+      evidence_sha256 "$current_evidence" \
+      consolidated_sha256 "$current_consolidated" \
+      phase summarizing || return 4
     return 2
   fi
-  claudex_state_set_field "$state_file" coverage_complete true
   if [ "$clean_count" -eq 5 ] && [ "$material" = "false" ]; then
-    claudex_state_set_field "$state_file" decision_signal converged
-    claudex_state_set_field "$state_file" clean true
-    claudex_state_set_field "$state_file" converged_snapshot_sha256 "$expected"
-    claudex_state_set_field "$state_file" phase summarizing
+    claudex_sweep_set_fields_atomic "$state_file" \
+      coverage_complete true \
+      decision_signal converged \
+      clean true \
+      revision_required false \
+      converged_snapshot_sha256 "$expected" \
+      evidence_sha256 "$current_evidence" \
+      consolidated_sha256 "$current_consolidated" \
+      phase summarizing || return 4
     return 0
   fi
-  claudex_state_set_field "$state_file" clean false
   local max_generations
   max_generations=$(claudex_state_read_field "$state_file" max_generations)
   case "$max_generations" in ''|*[!0-9]*) max_generations="$CLAUDEX_SWEEP_MAX_GENERATIONS" ;; esac
   [ "$max_generations" -le "$CLAUDEX_SWEEP_MAX_GENERATIONS" ] || max_generations="$CLAUDEX_SWEEP_MAX_GENERATIONS"
   if [ "$generation" -ge "$max_generations" ]; then
-    claudex_state_set_field "$state_file" decision_signal max-reached
-    claudex_state_set_field "$state_file" revision_required false
-    claudex_state_set_field "$state_file" phase summarizing
+    claudex_sweep_set_fields_atomic "$state_file" \
+      coverage_complete true \
+      decision_signal max-reached \
+      clean false \
+      revision_required false \
+      converged_snapshot_sha256 "" \
+      evidence_sha256 "$current_evidence" \
+      consolidated_sha256 "$current_consolidated" \
+      phase summarizing || return 4
     return 3
   fi
-  claudex_state_set_field "$state_file" decision_signal material-findings
-  claudex_state_set_field "$state_file" revision_required true
-  claudex_state_set_field "$state_file" phase awaiting-revision
+  claudex_sweep_set_fields_atomic "$state_file" \
+    coverage_complete true \
+    decision_signal material-findings \
+    clean false \
+    revision_required true \
+    converged_snapshot_sha256 "" \
+    evidence_sha256 "$current_evidence" \
+    consolidated_sha256 "$current_consolidated" \
+    phase awaiting-revision || return 4
   return 1
 }
 
@@ -366,7 +472,14 @@ for persona in \$CLAUDEX_SWEEP_PERSONAS; do
   findings="\$GENERATION_DIR/\$persona.findings.md"
   result="\$GENERATION_DIR/\$persona.result.json"
   prompt="\$GENERATION_DIR/.\$persona.prompt.txt"
-  rm -f "\$findings" "\$result" "\$prompt"
+  if [ -e "\$findings" ] || [ -e "\$result" ]; then
+    claudex_sweep_set_fields_atomic "\$STATE_FILE" \
+      coverage_complete false decision_signal degraded clean false \
+      revision_required false converged_snapshot_sha256 '' phase summarizing
+    echo "[claudex] refusing to replace existing generation evidence for \$persona" >&2
+    exit 2
+  fi
+  rm -f "\$prompt"
   before=\$(claudex_sha256 "\$SNAPSHOT" 2>/dev/null)
   live_before=\$(claudex_sha256 PLAN.md 2>/dev/null)
   focus=\$(claudex_sweep_persona_prompt "\$persona")
@@ -399,7 +512,12 @@ PROMPTEOF
     classification=\$(claudex_sweep_validate_findings "\$findings" 2>/dev/null)
     [ "\$classification" = clean ] || [ "\$classification" = material ] || classification=degraded
   fi
-  claudex_sweep_write_result "\$result" "\$persona" "\$EXPECTED" "\$before" "\$after" "\$rc" "\$findings" "\$classification"
+  if ! claudex_sweep_write_result "\$result" "\$persona" "\$EXPECTED" "\$before" "\$after" "\$rc" "\$findings" "\$classification"; then
+    claudex_sweep_set_fields_atomic "\$STATE_FILE" \
+      coverage_complete false decision_signal degraded clean false \
+      revision_required false converged_snapshot_sha256 '' phase summarizing
+    exit 2
+  fi
   claudex_state_set_field "\$STATE_FILE" sweep_heartbeat "\$persona"
   rm -f "\$prompt"
 done
