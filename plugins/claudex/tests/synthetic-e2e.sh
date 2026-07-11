@@ -103,7 +103,7 @@ check "PLAN.md exists" test -f PLAN.md
 section "Round 1: fire hook (drafting -> reviewing)"
 HOOK_OUT=$(echo '{}' | bash "$HOOK" 2>/dev/null)
 echo "Hook output: $(printf '%s' "$HOOK_OUT" | head -c 80)..."
-check "hook returned block" bash -c "echo '$HOOK_OUT' | grep -q block"
+check "hook returned block" python3 -c 'import json,sys; assert json.loads(sys.argv[1])["decision"] == "block"' "$HOOK_OUT"
 RUNNER=".claude/claudex/$REVIEW_ID-runner.sh"
 check "runner script created" test -f "$RUNNER"
 check "runner has quoted PROMPTEOF (P1 fix)" grep -q "<<'PROMPTEOF'" "$RUNNER"
@@ -128,14 +128,24 @@ section "Mark loop done (Claude's signal in production)"
 bash "$MARK_DONE" "$REVIEW_ID" >/dev/null
 PHASE=$(grep '^phase:' ".claude/claudex/$REVIEW_ID.state" | sed 's/^phase: //')
 SIGNAL=$(grep '^decision_signal:' ".claude/claudex/$REVIEW_ID.state" | sed 's/^decision_signal: //')
-check "phase marked done" test "$PHASE" = "done"
+check "mark-done leaves phase reviewing" test "$PHASE" = "reviewing"
 check "signal set to no-material-findings" test "$SIGNAL" = "no-material-findings"
 
-# Final hook fire, should ALLOW.
+# The current lifecycle delivers a summary BLOCK before the terminal APPROVE.
+section "Summary hook fire"
+HOOK_OUT=$(echo '{}' | bash "$HOOK" 2>/dev/null)
+echo "Summary hook output: $HOOK_OUT"
+check "summary hook returned block" python3 -c 'import json,sys; assert json.loads(sys.argv[1])["decision"] == "block"' "$HOOK_OUT"
+check "summary hook mentions completion" python3 -c 'import json,sys; assert "plan loop complete" in json.loads(sys.argv[1])["reason"].lower()' "$HOOK_OUT"
+PHASE=$(grep '^phase:' ".claude/claudex/$REVIEW_ID.state" | sed 's/^phase: //')
+check "phase advanced to summarizing" test "$PHASE" = "summarizing"
+
 section "Final hook fire"
 HOOK_OUT=$(echo '{}' | bash "$HOOK" 2>/dev/null)
 echo "Final hook output: $HOOK_OUT"
 check "final hook returned approve" bash -c "echo '$HOOK_OUT' | grep -q approve"
+PHASE=$(grep '^phase:' ".claude/claudex/$REVIEW_ID.state" | sed 's/^phase: //')
+check "phase advanced to done" test "$PHASE" = "done"
 check "lockfile cleaned up" bash -c "! test -f .claude/claudex/$REVIEW_ID.lock"
 check "state file preserved for audit" test -f ".claude/claudex/$REVIEW_ID.state"
 check "runner script cleaned up" bash -c "! test -f $RUNNER"

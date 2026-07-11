@@ -78,25 +78,35 @@ claudex_state_set_field() {
   local field="$2"
   local value="$3"
   [ -f "$file" ] || return 1
+  echo "$field" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$' || return 1
   local tmp="${file}.tmp.$$"
   local now
   now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  if grep -qE "^${field}:" "$file" 2>/dev/null; then
-    sed -E -e "s/^${field}: .*/${field}: ${value}/" \
-           -e "s/^last_updated_at: .*/last_updated_at: ${now}/" \
-           "$file" > "$tmp" 2>/dev/null \
-      || { rm -f "$tmp"; return 1; }
-  else
-    sed -E "s/^last_updated_at: .*/last_updated_at: ${now}/" "$file" > "$tmp" 2>/dev/null \
-      || { rm -f "$tmp"; return 1; }
-    printf '%s: %s\n' "$field" "$value" >> "$tmp" 2>/dev/null \
-      || { rm -f "$tmp"; return 1; }
-  fi
-  # Don't recursively bump last_updated_at when we ARE setting last_updated_at,
-  # otherwise the explicit value gets clobbered.
-  if [ "$field" = "last_updated_at" ]; then
-    sed -E "s/^last_updated_at: .*/last_updated_at: ${value}/" "$tmp" > "${tmp}.2" 2>/dev/null \
-      && mv -f "${tmp}.2" "$tmp"
+  # State is deliberately a single-line key/value format. Collapse embedded
+  # CR/LF to spaces, then write with printf instead of interpolating user data
+  # into sed replacement syntax (where '/', '&', and newlines are special).
+  value=$(printf '%s' "$value" | tr '\r\n' '  ')
+  local found=false
+  local saw_updated=false
+  : > "$tmp" || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$field:"*)
+        printf '%s: %s\n' "$field" "$value" >> "$tmp" || { rm -f "$tmp"; return 1; }
+        found=true
+        [ "$field" = "last_updated_at" ] && saw_updated=true
+        ;;
+      last_updated_at:*)
+        printf 'last_updated_at: %s\n' "$now" >> "$tmp" || { rm -f "$tmp"; return 1; }
+        saw_updated=true
+        ;;
+      *) printf '%s\n' "$line" >> "$tmp" || { rm -f "$tmp"; return 1; } ;;
+    esac
+  done < "$file"
+  [ "$found" = "true" ] || printf '%s: %s\n' "$field" "$value" >> "$tmp" \
+    || { rm -f "$tmp"; return 1; }
+  if [ "$field" != "last_updated_at" ] && [ "$saw_updated" != "true" ]; then
+    printf 'last_updated_at: %s\n' "$now" >> "$tmp" || { rm -f "$tmp"; return 1; }
   fi
   mv -f "$tmp" "$file" 2>/dev/null || { rm -f "$tmp"; return 1; }
   return 0

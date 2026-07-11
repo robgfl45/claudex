@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""Headless Claude Code -> Claudex -> Codex plan review adapter.
+
+Stdout is always one strict JSON document. Human/debug output and subprocess
+streams are retained in an evidence directory instead of being mixed into the
+machine-readable result.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Any
+
+TERMINAL_PHASES = {"done", "cancelled", "errored"}
+ACTIVE_PHASES = {"drafting", "reviewing", "revising", "summarizing"}
+EXIT_CODES = {"converged": 0, "max_reached": 10, "degraded": 11, "failed": 12, "timed_out": 124}
+
+
+def emit(payload: dict[str, Any], code: int) -> int:
+    print(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+    return code
+
+
+def fail(message: str, *, kind: str = "validation", evidence_dir: Path | None = None) -> int:
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "outcome": "failed",
+        "clean": False,
+        "error": {"kind": kind, "message": message},
+    }
+    if evidence_dir is not None:
+        payload["evidence_dir"] = str(evidence_dir)
+    return emit(payload, EXIT_CODES["failed"])
+
+
+def absolute_existing_dir(value: str, label: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError(f"{label} must be an absolute path")
+    resolved = path.resolve(strict=True)
+    if not resolved.is_dir():
+        raise ValueError(f"{label} is not a directory: {resolved}")
+    return resolved
+
+
+def absolute_existing_file(value: str, label: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError(f"{label} must be an absolute path")
+    resolved = path.resolve(strict=True)
+    if not resolved.is_file():
+        raise ValueError(f"{label} is not a file: {resolved}")
+    if resolved.stat().st_size == 0:
+        raise ValueError(f"{label} must be non-empty: {resolved}")
+    return resolved
+
+
+def executable(value: str, label: str) -> Path:
+    path = absolute_existing_file(value, label)
+    if not os.access(path, os.X_OK):
+        raise ValueError(f"{label} is not executable: {path}")
+    return path
+
+
+def run_probe(argv: list[str], cwd: Path, env: dict[str, str], timeout: float = 20) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(argv, cwd=cwd, env=env, text=True, capture_output=True, timeout=timeout, check=False)
+
+
+def parse_state(path: Path) -> dict[str, str]:
+    result: dict[str, str] = {}
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                result[key] = value.strip()
+    except OSError:
+        pass
+    return result
+
+
+def snapshot_state(state_file: Path, events, last: dict[str, str] | None) -> dict[str, str] | None:
+    if not state_file.exists():
+        return last
+    current = parse_state(state_file)
+    if current != last:
+        events.write(json.dumps({"at": dt.datetime.now(dt.timezone.utc).isoformat(), "state": current}, sort_keys=True) + "\n")
+        events.flush()
+    return current
+
+
+def final_findings_status(path: Path | None) -> tuple[str, dict[str, int]]:
+    counts = {"high": 0, "medium": 0, "low": 0}
+    if path is None or not path.is_file():
+        return "missing", counts
+    text = path.read_text(encoding="utf-8", errors="replace")
+    section = ""
+    for line in text.splitlines():
+        if line.startswith("## High"):
+            section = "high"
+        elif line.startswith("## Medium"):
+            section = "medium"
+        elif line.startswith("## Low"):
+            section = "low"
+        elif line.startswith("## "):
+            section = ""
+        elif line.startswith("- ") and section:
+            counts[section] += 1
+    no_findings = bool(re.search(r"(?mi)^No substantive findings\.\s*$", text))
+    if no_findings and not any(counts.values()):
+        return "none", counts
+    if any(counts.values()):
+        return "material", counts
+    return "unparseable", counts
+
+
+def parse_claude_stream(path: Path) -> dict[str, Any]:
+    summary: dict[str, Any] = {"result_records": 0, "reported_cost_usd": None, "session_id": None}
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("type") == "result":
+                summary["result_records"] += 1
+                summary["reported_cost_usd"] = obj.get("total_cost_usd", obj.get("cost_usd"))
+                summary["session_id"] = obj.get("session_id")
+                summary["claude_result_subtype"] = obj.get("subtype")
+    except OSError:
+        pass
+    return summary
+
+
+def copy_if_exists(source: Path, destination: Path) -> None:
+    if source.exists():
+        if source.is_dir():
+            shutil.copytree(source, destination, dirs_exist_ok=True)
+        else:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+
+
+class JsonArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        payload = {
+            "schema_version": 1,
+            "outcome": "failed",
+            "clean": False,
+            "error": {"kind": "arguments", "message": message},
+        }
+        print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        raise SystemExit(EXIT_CODES["failed"])
+
+
+def main() -> int:
+    parser = JsonArgumentParser(description="Run a bounded headless Claudex review of an existing plan")
+    parser.add_argument("--repo", required=True, help="absolute repository path")
+    parser.add_argument("--plan", required=True, help="absolute path to an existing non-empty PLAN.md")
+    parser.add_argument("--topic", required=True, help="self-contained review topic and constraints")
+    parser.add_argument("--rounds", required=True, type=int, help="positive Claudex round limit")
+    parser.add_argument("--timeout", required=True, type=float, help="wall-clock timeout in seconds")
+    parser.add_argument("--budget-usd", required=True, help="positive Claude Code budget cap")
+    default_plugin = Path(__file__).resolve().parents[1] / "plugins" / "claudex"
+    parser.add_argument("--plugin-root", default=str(default_plugin), help="absolute Claudex plugin root")
+    parser.add_argument("--claude", required=True, help="absolute Claude Code executable")
+    parser.add_argument("--codex", required=True, help="absolute Codex executable")
+    parser.add_argument("--output-dir", help="absolute evidence directory (must not already exist)")
+    parser.add_argument("--model", default="sonnet", help="Claude model passed to headless Claude Code")
+    args = parser.parse_args()
+
+    try:
+        repo = absolute_existing_dir(args.repo, "--repo")
+        if not (repo / ".git").exists():
+            raise ValueError(f"--repo must be a git working tree: {repo}")
+        plan = absolute_existing_file(args.plan, "--plan")
+        plugin = absolute_existing_dir(args.plugin_root, "--plugin-root")
+        claude = executable(args.claude, "--claude")
+        codex = executable(args.codex, "--codex")
+        if args.rounds < 1:
+            raise ValueError("--rounds must be a positive integer")
+        if args.timeout <= 0:
+            raise ValueError("--timeout must be positive")
+        if not args.topic.strip():
+            raise ValueError("--topic must be non-empty")
+        try:
+            budget = Decimal(args.budget_usd)
+        except InvalidOperation as exc:
+            raise ValueError("--budget-usd must be a positive decimal") from exc
+        if not budget.is_finite() or budget <= 0:
+            raise ValueError("--budget-usd must be a positive decimal")
+        required = [plugin / ".claude-plugin" / "plugin.json", plugin / "commands" / "plan.md", plugin / "hooks" / "stop-hook.sh", plugin / "scripts" / "state-helpers.sh"]
+        missing = [str(path) for path in required if not path.is_file()]
+        if missing:
+            raise ValueError("invalid Claudex plugin root; missing: " + ", ".join(missing))
+        manifest = json.loads(required[0].read_text(encoding="utf-8"))
+        if manifest.get("name") != "claudex":
+            raise ValueError(f"plugin manifest is not Claudex: {required[0]}")
+    except (ValueError, OSError) as exc:
+        return fail(str(exc))
+
+    state_dir = repo / ".claude" / "claudex"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    baseline_states = set(state_dir.glob("*.state"))
+    for state_file in baseline_states:
+        phase = parse_state(state_file).get("phase", "")
+        if phase in ACTIVE_PHASES or (phase and phase not in TERMINAL_PHASES):
+            return fail(f"active Claudex loop already exists: {state_file} (phase={phase})", kind="active_loop")
+
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    if args.output_dir:
+        output_dir_arg = Path(args.output_dir)
+        if not output_dir_arg.is_absolute():
+            return fail("--output-dir must be an absolute path")
+        evidence = output_dir_arg
+    else:
+        evidence = state_dir / "adapter-runs" / f"{stamp}-{uuid.uuid4().hex[:8]}"
+    if evidence.exists():
+        return fail(f"evidence directory already exists: {evidence}")
+    evidence.mkdir(parents=True)
+
+    env = os.environ.copy()
+    pinned_path = os.pathsep.join(dict.fromkeys([str(claude.parent), str(codex.parent), "/usr/bin", "/bin", "/usr/sbin", "/sbin"]))
+    env["PATH"] = pinned_path
+    env["CLAUDEX_ADAPTER_EVIDENCE_DIR"] = str(evidence)
+
+    preflight: dict[str, Any] = {"pinned_path": pinned_path, "plugin_root": str(plugin)}
+    try:
+        claude_version = run_probe([str(claude), "--version"], repo, env)
+        codex_version = run_probe([str(codex), "--version"], repo, env)
+        claude_auth = run_probe([str(claude), "auth", "status"], repo, env)
+        codex_auth = run_probe([str(codex), "login", "status"], repo, env)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return fail(f"prerequisite probe failed: {exc}", kind="prerequisite", evidence_dir=evidence)
+    preflight.update({
+        "claude": {"path": str(claude), "version": claude_version.stdout.strip()},
+        "codex": {"path": str(codex), "version": codex_version.stdout.strip()},
+        "claude_auth": claude_auth.stdout.strip(),
+        "codex_auth": (codex_auth.stdout + codex_auth.stderr).strip(),
+    })
+    (evidence / "preflight.json").write_text(json.dumps(preflight, indent=2, sort_keys=True) + "\n")
+    if claude_version.returncode != 0 or codex_version.returncode != 0:
+        return fail("Claude or Codex version probe failed", kind="prerequisite", evidence_dir=evidence)
+    try:
+        auth_obj = json.loads(claude_auth.stdout)
+    except json.JSONDecodeError:
+        auth_obj = {}
+    if claude_auth.returncode != 0 or auth_obj.get("loggedIn") is not True:
+        return fail("Claude Code authentication is not active", kind="authentication", evidence_dir=evidence)
+    if codex_auth.returncode != 0 or "logged in" not in (codex_auth.stdout + codex_auth.stderr).lower():
+        return fail("Codex authentication is not active", kind="authentication", evidence_dir=evidence)
+
+    runtime_plan = repo / "PLAN.md"
+    external_plan = plan != runtime_plan.resolve(strict=False)
+    original_runtime_plan = evidence / "repo-PLAN.original.md"
+    if external_plan and runtime_plan.exists():
+        shutil.copy2(runtime_plan, original_runtime_plan)
+    shutil.copy2(plan, evidence / "PLAN.before.md")
+    if external_plan:
+        shutil.copy2(plan, runtime_plan)
+
+    prompt = f"/claudex:plan --from-draft --skip-interview --rounds {args.rounds} {args.topic.strip()}"
+    command = [
+        str(claude), "--print", "--verbose", "--output-format", "stream-json", "--include-hook-events",
+        "--dangerously-skip-permissions", "--setting-sources", "project", "--plugin-dir", str(plugin),
+        "--model", args.model, "--max-budget-usd", str(budget), prompt,
+    ]
+    metadata = {
+        "argv": command, "cwd": str(repo), "timeout_seconds": args.timeout,
+        "budget_usd": str(budget), "rounds": args.rounds, "topic": args.topic,
+        "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    (evidence / "run-metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+
+    stdout_path = evidence / "claude-stream.jsonl"
+    stderr_path = evidence / "claude-stderr.log"
+    events_path = evidence / "state-events.jsonl"
+    started = time.monotonic()
+    timed_out = False
+    process: subprocess.Popen[bytes] | None = None
+    selected_state: Path | None = None
+    last_state: dict[str, str] | None = None
+    try:
+        with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr, events_path.open("w", encoding="utf-8") as events:
+            process = subprocess.Popen(command, cwd=repo, env=env, stdout=stdout, stderr=stderr, start_new_session=True)
+            while process.poll() is None:
+                new_states = [path for path in state_dir.glob("*.state") if path not in baseline_states]
+                if new_states:
+                    selected_state = max(new_states, key=lambda path: path.stat().st_mtime_ns)
+                    last_state = snapshot_state(selected_state, events, last_state)
+                if time.monotonic() - started >= args.timeout:
+                    timed_out = True
+                    os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait(timeout=5)
+                    break
+                time.sleep(0.2)
+            returncode = process.wait() if process.poll() is None else process.returncode
+            new_states = [path for path in state_dir.glob("*.state") if path not in baseline_states]
+            if new_states:
+                selected_state = max(new_states, key=lambda path: path.stat().st_mtime_ns)
+                last_state = snapshot_state(selected_state, events, last_state)
+    except (OSError, subprocess.SubprocessError) as exc:
+        if process is not None and process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        returncode = process.returncode if process and process.returncode is not None else 125
+        (evidence / "adapter-error.txt").write_text(str(exc) + "\n")
+
+    elapsed = round(time.monotonic() - started, 3)
+    if runtime_plan.exists():
+        shutil.copy2(runtime_plan, evidence / "PLAN.after.md")
+        if external_plan:
+            shutil.copy2(runtime_plan, plan)
+    if external_plan:
+        if original_runtime_plan.exists():
+            shutil.copy2(original_runtime_plan, runtime_plan)
+        else:
+            runtime_plan.unlink(missing_ok=True)
+
+    state = parse_state(selected_state) if selected_state else {}
+    review_id = state.get("review_id")
+    findings_files: list[Path] = []
+    if review_id:
+        findings_dir = state_dir / review_id
+        def finding_round(path: Path) -> int:
+            match = re.search(r"findings-round-(\d+)\.md$", path.name)
+            return int(match.group(1)) if match else -1
+        findings_files = sorted(findings_dir.glob("findings-round-*.md"), key=finding_round) if findings_dir.is_dir() else []
+        copy_if_exists(selected_state, evidence / "artifacts" / selected_state.name)
+        copy_if_exists(findings_dir, evidence / "artifacts" / review_id)
+    copy_if_exists(state_dir / "log", evidence / "artifacts" / "claudex.log")
+
+    final_findings = findings_files[-1] if findings_files else None
+    findings_status, severity = final_findings_status(final_findings)
+    phase = state.get("phase")
+    decision = state.get("decision_signal")
+    if timed_out:
+        outcome = "timed_out"
+        reason = "wall-clock timeout exceeded; process group terminated and reaped"
+    elif returncode != 0:
+        outcome = "failed"
+        reason = f"Claude Code exited non-zero ({returncode})"
+    elif not selected_state or not state:
+        outcome = "degraded"
+        reason = "Claude exited zero but no new Claudex state artifact was found"
+    elif decision == "no-material-findings" and phase == "done" and findings_status == "none":
+        outcome = "converged"
+        reason = "terminal state and final findings agree that no substantive findings remain"
+    elif decision == "max-reached" and phase == "done" and findings_status in {"material", "unparseable"}:
+        outcome = "max_reached"
+        reason = "round budget exhausted without an authoritative clean findings artifact"
+    else:
+        outcome = "degraded"
+        reason = f"state/artifact mismatch or incomplete lifecycle (phase={phase}, signal={decision}, findings={findings_status})"
+
+    stream_summary = parse_claude_stream(stdout_path)
+    result = {
+        "schema_version": 1,
+        "outcome": outcome,
+        "clean": outcome == "converged",
+        "reason": reason,
+        "repo": str(repo),
+        "plan": str(plan),
+        "review_id": review_id,
+        "phase": phase,
+        "decision_signal": decision,
+        "round": int(state["round"]) if state.get("round", "").isdigit() else None,
+        "max_rounds": int(state["max_rounds"]) if state.get("max_rounds", "").isdigit() else args.rounds,
+        "findings_status": findings_status,
+        "severity_counts": severity,
+        "final_findings": str(final_findings) if final_findings else None,
+        "evidence_dir": str(evidence),
+        "stdout_log": str(stdout_path),
+        "stderr_log": str(stderr_path),
+        "state_file": str(selected_state) if selected_state else None,
+        "elapsed_seconds": elapsed,
+        "process_exit_code": returncode,
+        "budget_usd": str(budget),
+        "reported_claude_cost_usd": stream_summary.get("reported_cost_usd"),
+        "claude_session_id": stream_summary.get("session_id"),
+    }
+    (evidence / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    return emit(result, EXIT_CODES[outcome])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

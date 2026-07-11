@@ -233,6 +233,12 @@ The Stop hook is fail-open everywhere. Any error returns `{"decision":"approve"}
 | `CLAUDEX_STALE_MINUTES` | 15 | Loops older than this are auto-swept on next invocation |
 | `CLAUDEX_STATE_DIR` | `.claude/claudex` | State directory location |
 
+## Headless Hermes planning bridge
+
+This fork adds [`bin/claudex-plan-review`](docs/HEADLESS_ADAPTER.md), a production-oriented adapter for running an existing `PLAN.md` through headless Claude Code, the Claudex Stop-hook lifecycle, and real Codex reviews from a Hermes leaf subagent. It validates explicit executable/plugin/auth prerequisites, pins child `PATH`, enforces wall-clock and Claude budget bounds, kills the complete process group on timeout, preserves evidence, and emits one strict JSON result.
+
+Only `converged` is clean. `max_reached`, `degraded`, `failed`, and `timed_out` are explicit non-clean outcomes. Classification is based on Claudex state and findings artifacts, never Claude's prose tally. See the adapter document for exact usage, exit codes, costs, architecture, and staging instructions. The in-repo Hermes skill is staged at [`skills/project-plan-review/`](skills/project-plan-review/SKILL.md); it is not installed automatically.
+
 ## Cost expectation
 
 Each plan-mode round is one full Codex review of `PLAN.md`. In practice that's ~25–30k Codex tokens per round. With the default 3 rounds you should expect **~75–90k tokens per `/claudex:plan`**. Codex authenticates against your ChatGPT account, so the bill goes to your ChatGPT Plus / Pro / Team / Enterprise plan, not to claudex. If you're on a tight rate limit, run `--rounds 2` for fast topics and reserve `--rounds 5+` for high-stakes designs.
@@ -260,17 +266,20 @@ Highlights:
 ## Tests
 
 ```bash
-# Phase 0: confirm platform behaviors work on your machine (50 checks)
+# Phase 0: confirm platform behaviors work on your machine (count printed by test)
 bash plugins/claudex/tests/platform-validation.sh
 
-# Smoke test: simulate full lifecycle without invoking Codex (60 checks)
+# Smoke test: simulate full lifecycle without invoking Codex (count printed by test)
 bash plugins/claudex/tests/smoke-test.sh
 
-# Synthetic E2E: real Codex calls against a throwaway repo (19 checks, costs a few cents in tokens)
+# Synthetic E2E: real Codex calls against a throwaway repo (count printed by test; uses subscription tokens)
 bash plugins/claudex/tests/synthetic-e2e.sh
+
+# Headless adapter deterministic unit/error/timeout/state-isolation tests
+python3 -m unittest -v tests/test_adapter.py
 ```
 
-All three should pass before trusting claudex on a real project.
+Run the platform, smoke, and adapter suites for every change. Run the live synthetic E2E when authenticated Codex usage is available.
 
 ## Project structure
 

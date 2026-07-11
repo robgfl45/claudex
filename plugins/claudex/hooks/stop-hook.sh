@@ -90,9 +90,11 @@ STARTED_AT_EPOCH=$(claudex_state_read_field "$ACTIVE_STATE" "started_at_epoch")
 
 log "State: mode=$MODE phase=$PHASE round=$ROUND/$MAX_ROUNDS signal=$DECISION_SIGNAL"
 
-# Sanity: if cwd doesn't match the repo where the loop started, fail-open.
-if [ -n "$REPO_ROOT_STATE" ] && [ "$REPO_ROOT_STATE" != "$(pwd)" ]; then
-  log "cwd mismatch (state=$REPO_ROOT_STATE, here=$(pwd)); fail-open"
+# Sanity: compare canonical physical paths so symlink/casing aliases do not
+# fail-open a loop that is still running in the same repository.
+CURRENT_REPO_ROOT="$(pwd -P)"
+if [ -n "$REPO_ROOT_STATE" ] && [ "$REPO_ROOT_STATE" != "$CURRENT_REPO_ROOT" ]; then
+  log "cwd mismatch (state=$REPO_ROOT_STATE, here=$CURRENT_REPO_ROOT); fail-open"
   approve "cwd mismatch"
 fi
 
