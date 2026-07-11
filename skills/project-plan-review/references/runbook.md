@@ -21,10 +21,12 @@ Use the smallest justified cap:
 
 | Tier | Cap | Use when |
 |---|---:|---|
-| Routine/reversible | 0 normally; 1 when useful | Small blast radius, easy rollback, no sensitive boundary |
+| Routine/reversible | 1 if invoked | Skip the adapter by default; invoke one generation only when independent review adds clear value |
 | Substantial/cross-cutting | 2 | Default substantial project plan |
 | Security/privacy/migration/operations-critical | 3 | Credible security, data, rollout, recovery, or irreversible risk |
 | Exceptional | 5 | Rob explicitly approves five generations for this exact plan |
+
+For routine work where review is skipped, stop this workflow before preparing `EVIDENCE` or invoking the adapter; no Claudex terminal evidence is expected. Continue to the execution template only when `ROUNDS` is an integer in `1..5`.
 
 Do not raise `ROUNDS` after launch merely because the configured cap returned findings. Use targeted closure after the cap.
 

@@ -4,7 +4,7 @@ Use this workflow when the configured proportional cap completes with material f
 
 ## Preconditions
 
-- The cap was selected before launch: normally two generations for substantial work or three for security-/data-/operations-critical work.
+- The cap was selected before launch: normally two generations for substantial work, three for security/privacy/migration/operations-critical work, or five only with Rob's explicit approval for that exact plan.
 - The terminal generation has readable, valid five-persona same-hash evidence.
 - The adapter outcome and any live-plan/snapshot mismatch are understood.
 - No owned adapter, Claude, Codex, or reviewer process remains.
