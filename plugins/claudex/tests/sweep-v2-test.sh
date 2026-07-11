@@ -367,19 +367,26 @@ check "generation two manifest links previous hash" python3 - ".claude/claudex/$
 import json, pathlib, sys
 assert json.loads(pathlib.Path(sys.argv[1]).read_text())['previous_generation_sha256']==sys.argv[2]
 PY
+check "topic remains logically identical across generations" python3 - ".claude/claudex/$ID/generations/1/manifest.json" ".claude/claudex/$ID/generations/2/manifest.json" <<'PY'
+import json, pathlib, sys
+first = json.loads(pathlib.Path(sys.argv[1]).read_text())['topic']
+second = json.loads(pathlib.Path(sys.argv[2]).read_text())['topic']
+assert first == second == 'deterministic sweep test'
+PY
 
 new_repo; start_sweep
 source "$PLUGIN_ROOT/scripts/state-helpers.sh"
 source "$PLUGIN_ROOT/scripts/personas.sh"
 source "$PLUGIN_ROOT/scripts/sweep-helpers.sh"
 PREV=$(field "$STATE" snapshot_sha256)
+SWEEP_TOPIC=$(claudex_state_read_field "$STATE" topic)
 for g in 2 3 4 5; do
   chmod u+w PLAN.md; printf '\nrevision %s\n' "$g" >> PLAN.md
-  SHA=$(claudex_sweep_create_generation "$STATE" "$ID" "$g" "max generation test" "$PREV") || break
+  SHA=$(claudex_sweep_create_generation "$STATE" "$ID" "$g" "$SWEEP_TOPIC" "$PREV") || break
   PREV="$SHA"
 done
 claudex_state_set_field "$STATE" phase reviewing
-claudex_sweep_write_runner "$STATE" "$ID" 5 "max generation test" "$PREV"
+claudex_sweep_write_runner "$STATE" "$ID" 5 "$SWEEP_TOPIC" "$PREV"
 RUNNER=".claude/claudex/$ID-runner.sh"
 export CLAUDEX_SWEEP_STUB_MODE=material CLAUDEX_SWEEP_STUB_PERSONA=security-data
 bash "$RUNNER" >/dev/null 2>&1
@@ -390,7 +397,7 @@ bash "$RUNNER" >/dev/null 2>&1
 OLD_DIR=".claude/claudex/$ID/generations/1"; OLD_SHA=$(field "$STATE" snapshot_sha256)
 chmod u+w PLAN.md; printf '\nnew generation\n' >> PLAN.md
 source "$PLUGIN_ROOT/scripts/state-helpers.sh"; source "$PLUGIN_ROOT/scripts/personas.sh"; source "$PLUGIN_ROOT/scripts/sweep-helpers.sh"
-NEW_SHA=$(claudex_sweep_create_generation "$STATE" "$ID" 2 "stale test" "$OLD_SHA")
+NEW_SHA=$(claudex_sweep_create_generation "$STATE" "$ID" 2 "$(claudex_state_read_field "$STATE" topic)" "$OLD_SHA")
 NEW_DIR=".claude/claudex/$ID/generations/2"
 cp "$OLD_DIR"/*.findings.md "$OLD_DIR"/*.result.json "$NEW_DIR"/
 claudex_sweep_consolidate "$STATE" "$ID" 2 "$NEW_SHA" "$NEW_SHA" >/dev/null 2>&1

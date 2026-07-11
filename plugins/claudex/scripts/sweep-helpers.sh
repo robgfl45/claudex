@@ -280,17 +280,18 @@ claudex_sweep_consolidate() {
     fi
   fi
   local manifest="$generation_dir/manifest.json"
-  local manifest_valid
-  manifest_valid=$(python3 - "$manifest" "$generation" "$expected" "$generation_dir" "$(pwd -P)/PLAN.md" <<'PY'
+  local manifest_valid state_topic
+  state_topic=$(claudex_state_read_field "$state_file" topic)
+  manifest_valid=$(python3 - "$manifest" "$generation" "$expected" "$generation_dir" "$(pwd -P)/PLAN.md" "$state_topic" <<'PY'
 import json, pathlib, sys
-path, generation, expected, generation_dir, source = sys.argv[1:]
+path, generation, expected, generation_dir, source, topic = sys.argv[1:]
 ids = ["architecture-scope", "security-data", "product-domain", "quality-accessibility-performance", "operations-deployment"]
 try:
     m = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
     ok = m.get("generation") == int(generation)
     ok &= m.get("snapshot_sha256") == expected
     ok &= m.get("required_persona_ids") == ids
-    ok &= m.get("source_plan_path") == source and bool(m.get("topic"))
+    ok &= m.get("source_plan_path") == source and m.get("topic") == topic and bool(topic)
     if int(generation) == 1:
         ok &= m.get("previous_generation_sha256") is None
     else:

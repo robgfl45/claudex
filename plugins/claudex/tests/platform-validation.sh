@@ -93,6 +93,7 @@ cd "$TMP"
 mkdir -p .claude/claudex
 content="phase: drafting
 round: 1
+topic: \"atomic persistence topic\"
 last_updated_at: 2026-04-26T00:00:00Z"
 claudex_state_write ".claude/claudex/test.state" "$content"
 check "state file created" test -f ".claude/claudex/test.state"
@@ -100,6 +101,8 @@ phase_val=$(claudex_state_read_field ".claude/claudex/test.state" phase)
 check "phase field readable" test "$phase_val" = "drafting"
 round_val=$(claudex_state_read_field ".claude/claudex/test.state" round)
 check "round field readable" test "$round_val" = "1"
+topic_val=$(claudex_state_read_field ".claude/claudex/test.state" topic)
+check "quoted topic is read as its logical value" test "$topic_val" = "atomic persistence topic"
 cd - >/dev/null
 rm -rf "$TMP"
 

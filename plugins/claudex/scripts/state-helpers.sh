@@ -51,7 +51,19 @@ claudex_state_read_field() {
   local file="$1"
   local field="$2"
   [ -f "$file" ] || return 1
-  grep -E "^${field}:" "$file" 2>/dev/null | head -1 | sed -E "s/^${field}: *//"
+  local value
+  value=$(grep -E "^${field}:" "$file" 2>/dev/null | head -1 | sed -E "s/^${field}: *//") || return 1
+  # start-loop stores user topics as a single double-quoted scalar. Return the
+  # logical value so later generations receive the exact same topic as
+  # generation one instead of accumulating literal quote characters.
+  case "$value" in
+    \"*\")
+      value=${value#\"}
+      value=${value%\"}
+      printf '%s' "$value" | sed -e 's/\\\"/\"/g'
+      ;;
+    *) printf '%s' "$value" ;;
+  esac
 }
 
 claudex_phase_transition() {
