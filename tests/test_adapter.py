@@ -86,9 +86,10 @@ else:
         previous_dir.mkdir(parents=True)
         (previous_dir / 'manifest.json').write_text(json.dumps({'snapshot_sha256': snapshot_hash}))
         previous_hash = snapshot_hash
+    manifest_topic = 'different topic' if outcome == 'sweep_topic_mismatch' else 'test'
     manifest = {
         'generation': generation, 'snapshot_sha256': snapshot_hash,
-        'required_persona_ids': personas, 'topic': 'grounded test topic',
+        'required_persona_ids': personas, 'topic': manifest_topic,
         'source_plan_path': str(pathlib.Path.cwd().resolve() / 'PLAN.md'),
         'previous_generation_sha256': previous_hash,
     }
@@ -138,7 +139,8 @@ else:
     phase = 'cancelled' if outcome == 'sweep_cancelled' else 'done'
     clean = 'false' if outcome in {'sweep_max', 'sweep_cancelled', 'sweep_degraded'} else 'true'
     converged_hash = '' if outcome in {'sweep_max', 'sweep_cancelled', 'sweep_degraded'} else snapshot_hash
-    state_path.write_text(f'''mode: plan\nphase: {phase}\ntopic: test\nround: {generation}\nmax_rounds: {maximum}\nreview_id: {rid}\nrepo_root: {pathlib.Path.cwd().resolve()}\ndecision_signal: {signal}\nengine: sweep-v2\ngeneration: {generation}\nmax_generations: {maximum}\nsnapshot_sha256: {snapshot_hash}\ncoverage_complete: true\nclean: {clean}\nrevision_required: false\nreviewed_live_sha256: {snapshot_hash}\nevidence_sha256: {evidence.hexdigest()}\nconsolidated_sha256: {hashlib.sha256(consolidated.read_bytes()).hexdigest()}\nconverged_snapshot_sha256: {converged_hash}\n''')
+    state_review_id = '20990101-000000-deadbe' if outcome == 'sweep_review_id_mismatch' else rid
+    state_path.write_text(f'''mode: plan\nphase: {phase}\ntopic: test\nround: {generation}\nmax_rounds: {maximum}\nreview_id: {state_review_id}\nrepo_root: {pathlib.Path.cwd().resolve()}\ndecision_signal: {signal}\nengine: sweep-v2\ngeneration: {generation}\nmax_generations: {maximum}\nsnapshot_sha256: {snapshot_hash}\ncoverage_complete: true\nclean: {clean}\nrevision_required: false\nreviewed_live_sha256: {snapshot_hash}\nevidence_sha256: {evidence.hexdigest()}\nconsolidated_sha256: {hashlib.sha256(consolidated.read_bytes()).hexdigest()}\nconverged_snapshot_sha256: {converged_hash}\n''')
 print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01, 'session_id': 'fake-session'}))
 """)
 
@@ -208,6 +210,18 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         self.assertFalse(result["clean"])
         self.assertIn("hash-mismatched", result["reason"])
 
+    def test_state_filename_and_review_id_must_match(self):
+        completed, result = self.run_adapter("sweep_review_id_mismatch")
+        self.assertEqual(completed.returncode, 11)
+        self.assertFalse(result["clean"])
+        self.assertIn("filename and review_id", result["reason"])
+
+    def test_manifest_topic_must_match_state(self):
+        completed, result = self.run_adapter("sweep_topic_mismatch")
+        self.assertEqual(completed.returncode, 11)
+        self.assertFalse(result["clean"])
+        self.assertIn("manifest topic does not match state", result["reason"])
+
     def test_mutated_consolidated_findings_cannot_be_clean(self):
         completed, result = self.run_adapter("sweep_mutated_consolidated")
         self.assertEqual(completed.returncode, 11)
@@ -263,6 +277,19 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         self.assertEqual(completed.returncode, 12)
         self.assertEqual(result["error"]["kind"], "validation")
         self.assertIn("1..5", result["error"]["message"])
+
+    def test_unexpected_io_failure_still_emits_one_json_document(self):
+        output_dir = Path("/dev/null/claudex-evidence")
+        completed = subprocess.run([
+            str(ADAPTER), "--repo", str(self.repo.resolve()), "--plan", str(self.plan.resolve()),
+            "--topic", "x", "--rounds", "1", "--timeout", "1", "--budget-usd", "1",
+            "--plugin-root", str(PLUGIN.resolve()), "--claude", str(self.claude.resolve()),
+            "--codex", str(self.codex.resolve()), "--output-dir", str(output_dir),
+        ], text=True, capture_output=True)
+        self.assertEqual(len(completed.stdout.splitlines()), 1, completed.stdout)
+        result = json.loads(completed.stdout)
+        self.assertEqual(completed.returncode, 12)
+        self.assertEqual(result["error"]["kind"], "internal")
 
     def test_relative_repo_is_rejected_as_json(self):
         completed = subprocess.run([

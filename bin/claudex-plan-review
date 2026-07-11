@@ -214,6 +214,15 @@ def validate_sweep(state_file: Path, review_dir: Path, runtime_plan: Path, revie
 
     generation = integer("generation")
     maximum = integer("max_generations")
+    expected_review_id = state_file.stem
+    if state.get("review_id") != expected_review_id or review_dir.name != expected_review_id:
+        errors.append("state filename, review_id, and review evidence directory do not match")
+    if state.get("mode") != "plan":
+        errors.append("state mode is not plan")
+    if state.get("repo_root") != str(runtime_plan.parent):
+        errors.append("state repo_root does not match the reviewed repository")
+    if not state.get("topic"):
+        errors.append("state topic is empty")
     if state.get("engine") != "sweep-v2":
         errors.append("state engine is not sweep-v2")
     if generation is None or not 1 <= generation <= 5:
@@ -253,6 +262,8 @@ def validate_sweep(state_file: Path, review_dir: Path, runtime_plan: Path, revie
             errors.append("generation manifest does not require the exact five personas")
         if not isinstance(manifest.get("topic"), str) or not manifest.get("topic"):
             errors.append("generation manifest topic is empty")
+        elif manifest.get("topic") != state.get("topic"):
+            errors.append("generation manifest topic does not match state")
         if manifest.get("source_plan_path") != str(runtime_plan):
             errors.append("generation manifest source plan path is mismatched")
         if generation == 1 and manifest.get("previous_generation_sha256") is not None:
@@ -595,12 +606,13 @@ def main() -> int:
     state = parse_state(selected_state) if selected_state else {}
     review_id = state.get("review_id")
     valid_review_id = bool(review_id and re.fullmatch(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{6}", review_id))
+    state_identity_valid = bool(valid_review_id and selected_state and selected_state.stem == review_id)
     findings_files: list[Path] = []
     findings_dir: Path | None = None
     evidence_state: Path | None = None
     evidence_review_dir: Path | None = None
     copy_errors: list[str] = []
-    if valid_review_id:
+    if state_identity_valid:
         findings_dir = state_dir / str(review_id)
 
         def finding_round(path: Path) -> int:
@@ -638,9 +650,9 @@ def main() -> int:
     elif not selected_state or not state:
         outcome = "degraded"
         reason = "Claude exited zero but no new Claudex state artifact was found"
-    elif not valid_review_id or findings_dir is None:
+    elif not state_identity_valid or findings_dir is None:
         outcome = "degraded"
-        reason = "Claudex state contains a missing or malformed review_id"
+        reason = "Claudex state filename and review_id are missing, malformed, or mismatched"
     elif copy_errors:
         outcome = "degraded"
         reason = "required adapter evidence could not be copied: " + "; ".join(copy_errors)
@@ -670,9 +682,13 @@ def main() -> int:
     copied_manifest = None
     copied_generation_dir = None
     if sweep and evidence_review_dir and sweep.get("generation"):
-        copied_generation_dir = evidence_review_dir / "generations" / str(sweep["generation"])
-        copied_consolidated = copied_generation_dir / "consolidated-findings.md"
-        copied_manifest = copied_generation_dir / "manifest.json"
+        generation_candidate = evidence_review_dir / "generations" / str(sweep["generation"])
+        if generation_candidate.is_dir():
+            copied_generation_dir = generation_candidate
+            consolidated_candidate = generation_candidate / "consolidated-findings.md"
+            manifest_candidate = generation_candidate / "manifest.json"
+            copied_consolidated = consolidated_candidate if consolidated_candidate.is_file() else None
+            copied_manifest = manifest_candidate if manifest_candidate.is_file() else None
 
     stream_summary = parse_claude_stream(stdout_path)
     result = {
@@ -717,4 +733,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        sys.exit(fail(f"unexpected adapter failure: {type(exc).__name__}: {exc}", kind="internal"))
