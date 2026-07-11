@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -26,6 +27,33 @@ from typing import Any
 TERMINAL_PHASES = {"done", "cancelled", "errored"}
 ACTIVE_PHASES = {"drafting", "reviewing", "revising", "summarizing"}
 EXIT_CODES = {"converged": 0, "max_reached": 10, "degraded": 11, "failed": 12, "timed_out": 124}
+SWEEP_PERSONAS = [
+    "architecture-scope",
+    "security-data",
+    "product-domain",
+    "quality-accessibility-performance",
+    "operations-deployment",
+]
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_PENDING_PLAN_RESTORE: tuple[Path, Path, bool] | None = None
+
+
+def restore_pending_plan() -> str | None:
+    """Best-effort restoration for an externally staged repository PLAN.md."""
+    global _PENDING_PLAN_RESTORE
+    pending = _PENDING_PLAN_RESTORE
+    if pending is None:
+        return None
+    runtime_plan, original_plan, had_original = pending
+    try:
+        if had_original:
+            shutil.copy2(original_plan, runtime_plan)
+        else:
+            runtime_plan.unlink(missing_ok=True)
+    except OSError as exc:
+        return str(exc)
+    _PENDING_PLAN_RESTORE = None
+    return None
 
 
 def emit(payload: dict[str, Any], code: int) -> int:
@@ -127,6 +155,285 @@ def final_findings_status(path: Path | None) -> tuple[str, dict[str, int]]:
     return "unparseable", counts
 
 
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def strict_state(path: Path) -> tuple[dict[str, str], list[str]]:
+    state: dict[str, str] = {}
+    errors: list[str] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        return {}, [f"state is unreadable: {exc}"]
+    for number, line in enumerate(lines, 1):
+        if ":" not in line:
+            errors.append(f"state line {number} is malformed")
+            continue
+        key, value = line.split(":", 1)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            errors.append(f"state line {number} has an invalid key")
+        elif key in state:
+            errors.append(f"state contains duplicate field {key}")
+        else:
+            state[key] = value.strip()
+    return state, errors
+
+
+def sweep_findings(path: Path) -> tuple[str, dict[str, int]]:
+    counts = {"high": 0, "medium": 0, "low": 0}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return "malformed", counts
+    if text.strip() == "No substantive findings.":
+        return "clean", counts
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    headers = ["## High", "## Medium", "## Low"]
+    if any(lines.count(header) != 1 for header in headers):
+        return "malformed", counts
+    positions = [lines.index(header) for header in headers]
+    if positions != sorted(positions) or lines[: positions[0]]:
+        return "malformed", counts
+    for index, start in enumerate(positions):
+        end = positions[index + 1] if index + 1 < len(positions) else len(lines)
+        severity = headers[index][3:].lower()
+        for line in lines[start + 1 : end]:
+            if not line.startswith("- ") or len(line) <= 2:
+                return "malformed", counts
+            counts[severity] += 1
+    return ("material" if any(counts.values()) else "malformed"), counts
+
+
+def render_sweep_findings(path: Path, persona: str) -> str:
+    severity = ""
+    counts = {"high": 0, "medium": 0, "low": 0}
+    rendered: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line in {"## High", "## Medium", "## Low"}:
+            severity = line[3:].lower()
+            rendered.append(line)
+        elif line.startswith("- ") and severity:
+            counts[severity] += 1
+            rendered.append(f"- [{persona}-{severity}-{counts[severity]}] {line[2:]}")
+        else:
+            rendered.append(line)
+    return "\n".join(rendered)
+
+
+def validate_sweep(state_file: Path, review_dir: Path, source_review_dir: Path, runtime_plan: Path, reviewed_plan: Path, requested: int, requested_topic: str) -> dict[str, Any]:
+    """Recompute a sweep verdict from runner-authored state and artifacts."""
+    state, errors = strict_state(state_file)
+    coverage: list[dict[str, Any]] = []
+    severity = {"high": 0, "medium": 0, "low": 0}
+
+    def integer(name: str) -> int | None:
+        value = state.get(name, "")
+        return int(value) if value.isdigit() else None
+
+    generation = integer("generation")
+    maximum = integer("max_generations")
+    expected_review_id = state_file.stem
+    if state.get("review_id") != expected_review_id or review_dir.name != expected_review_id or source_review_dir.name != expected_review_id:
+        errors.append("state filename, review_id, and review evidence directory do not match")
+    if state.get("mode") != "plan":
+        errors.append("state mode is not plan")
+    if state.get("repo_root") != str(runtime_plan.parent):
+        errors.append("state repo_root does not match the reviewed repository")
+    if not state.get("topic"):
+        errors.append("state topic is empty")
+    elif state.get("topic") != requested_topic:
+        errors.append("state topic does not match the requested topic")
+    if state.get("engine") != "sweep-v2":
+        errors.append("state engine is not sweep-v2")
+    if generation is None or not 1 <= generation <= 5:
+        errors.append("state generation is not in 1..5")
+    if maximum is None or not 1 <= maximum <= 5:
+        errors.append("state max_generations is not in 1..5")
+    elif maximum != requested:
+        errors.append("state max_generations does not match the requested cap")
+    if generation and maximum and generation > maximum:
+        errors.append("state generation exceeds max_generations")
+
+    generation_dir = review_dir / "generations" / str(generation) if generation else None
+    snapshot = generation_dir / "PLAN.md" if generation_dir else None
+    manifest_path = generation_dir / "manifest.json" if generation_dir else None
+    consolidated = generation_dir / "consolidated-findings.md" if generation_dir else None
+    snapshot_hash = state.get("snapshot_sha256", "")
+    if not SHA256_RE.fullmatch(snapshot_hash):
+        errors.append("state snapshot_sha256 is malformed")
+    if state.get("reviewed_live_sha256") != snapshot_hash:
+        errors.append("state reviewed_live_sha256 does not match the current snapshot")
+
+    manifest: dict[str, Any] = {}
+    manifest_loaded = False
+    if manifest_path:
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                raise ValueError("manifest is not an object")
+            manifest_loaded = True
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            errors.append(f"generation manifest is unreadable or malformed: {exc}")
+    if manifest_loaded:
+        required = {"generation", "snapshot_sha256", "required_persona_ids", "topic", "source_plan_path", "previous_generation_sha256"}
+        if set(manifest) != required:
+            errors.append("generation manifest fields do not match the sweep-v2 schema")
+        if manifest.get("generation") != generation or manifest.get("snapshot_sha256") != snapshot_hash:
+            errors.append("generation manifest does not match state generation/hash")
+        if manifest.get("required_persona_ids") != SWEEP_PERSONAS:
+            errors.append("generation manifest does not require the exact five personas")
+        if not isinstance(manifest.get("topic"), str) or not manifest.get("topic"):
+            errors.append("generation manifest topic is empty")
+        elif manifest.get("topic") != state.get("topic"):
+            errors.append("generation manifest topic does not match state")
+        if manifest.get("source_plan_path") != str(runtime_plan):
+            errors.append("generation manifest source plan path is mismatched")
+
+    # Validate the complete immutable snapshot chain, not only the immediate
+    # predecessor. This prevents a terminal generation from hiding a missing,
+    # malformed, or unchanged earlier generation.
+    if generation:
+        chain_previous: str | None = None
+        required_manifest_fields = {"generation", "snapshot_sha256", "required_persona_ids", "topic", "source_plan_path", "previous_generation_sha256"}
+        for index in range(1, generation + 1):
+            chain_dir = review_dir / "generations" / str(index)
+            try:
+                chain_manifest = json.loads((chain_dir / "manifest.json").read_text(encoding="utf-8"))
+                if not isinstance(chain_manifest, dict) or set(chain_manifest) != required_manifest_fields:
+                    raise ValueError("manifest schema mismatch")
+                chain_hash = chain_manifest.get("snapshot_sha256")
+                if chain_manifest.get("generation") != index:
+                    raise ValueError("generation number mismatch")
+                if chain_manifest.get("required_persona_ids") != SWEEP_PERSONAS:
+                    raise ValueError("persona set mismatch")
+                if chain_manifest.get("topic") != requested_topic:
+                    raise ValueError("topic mismatch")
+                if chain_manifest.get("source_plan_path") != str(runtime_plan):
+                    raise ValueError("source path mismatch")
+                if not isinstance(chain_hash, str) or not SHA256_RE.fullmatch(chain_hash):
+                    raise ValueError("snapshot hash is malformed")
+                if chain_manifest.get("previous_generation_sha256") != chain_previous:
+                    raise ValueError("previous hash linkage mismatch")
+                if chain_previous is not None and chain_hash == chain_previous:
+                    raise ValueError("generation snapshot did not change")
+                if sha256_file(chain_dir / "PLAN.md") != chain_hash:
+                    raise ValueError("snapshot bytes do not match manifest")
+                chain_previous = chain_hash
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                errors.append(f"generation {index} manifest/snapshot chain is invalid: {exc}")
+                break
+
+    try:
+        if not snapshot or sha256_file(snapshot) != snapshot_hash:
+            errors.append("frozen snapshot hash does not match state")
+    except OSError as exc:
+        errors.append(f"frozen snapshot is unreadable: {exc}")
+    try:
+        if sha256_file(reviewed_plan) != snapshot_hash:
+            errors.append("reviewed live PLAN.md is not the frozen snapshot")
+    except OSError as exc:
+        errors.append(f"reviewed live PLAN.md is unreadable: {exc}")
+
+    evidence_digest = hashlib.sha256()
+    chunks = [f"# Consolidated findings — generation {generation}\n\n", f"Snapshot SHA-256: `{snapshot_hash}`\n\n"]
+    if generation_dir:
+        for persona in SWEEP_PERSONAS:
+            findings = generation_dir / f"{persona}.findings.md"
+            sidecar = generation_dir / f"{persona}.result.json"
+            classification, counts = sweep_findings(findings)
+            entry: dict[str, Any] = {
+                "persona_id": persona,
+                "classification": classification,
+                "snapshot_sha256": None,
+                "valid": False,
+            }
+            for key in severity:
+                severity[key] += counts[key]
+            sidecar_data: dict[str, Any] = {}
+            try:
+                sidecar_data = json.loads(sidecar.read_text(encoding="utf-8"))
+                if not isinstance(sidecar_data, dict):
+                    raise ValueError("sidecar is not an object")
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+                errors.append(f"{persona} sidecar is unreadable or malformed: {exc}")
+            if sidecar_data:
+                required = {"persona_id", "expected_snapshot_sha256", "actual_snapshot_sha256_before", "actual_snapshot_sha256_after", "codex_exit_code", "findings_path", "findings_sha256", "findings_classification", "completed_at"}
+                expected_path = str(source_review_dir / "generations" / str(generation) / findings.name)
+                valid = set(sidecar_data) == required
+                valid &= sidecar_data.get("persona_id") == persona
+                valid &= sidecar_data.get("expected_snapshot_sha256") == snapshot_hash
+                valid &= sidecar_data.get("actual_snapshot_sha256_before") == snapshot_hash
+                valid &= sidecar_data.get("actual_snapshot_sha256_after") == snapshot_hash
+                valid &= sidecar_data.get("codex_exit_code") == 0
+                valid &= sidecar_data.get("findings_path") == expected_path
+                valid &= sidecar_data.get("findings_classification") == classification
+                try:
+                    valid &= sidecar_data.get("findings_sha256") == sha256_file(findings)
+                except OSError:
+                    valid = False
+                try:
+                    dt.datetime.strptime(str(sidecar_data.get("completed_at")), "%Y-%m-%dT%H:%M:%SZ")
+                except (TypeError, ValueError):
+                    valid = False
+                if not valid or classification not in {"clean", "material"}:
+                    errors.append(f"{persona} evidence is incomplete, hash-mismatched, or malformed")
+                else:
+                    entry.update(snapshot_sha256=snapshot_hash, valid=True)
+            coverage.append(entry)
+            chunks.append(f"## {persona}\n\n")
+            if classification == "clean":
+                chunks.append(findings.read_text(encoding="utf-8") + "\n\n")
+            elif classification == "material":
+                chunks.append(render_sweep_findings(findings, persona) + "\n\n\n")
+            else:
+                chunks.append("DEGRADED: invalid evidence.\n\n")
+            for artifact in (findings, sidecar):
+                try:
+                    evidence_digest.update(artifact.name.encode("utf-8") + b"\0")
+                    evidence_digest.update(artifact.read_bytes())
+                    evidence_digest.update(b"\0")
+                except OSError:
+                    pass
+
+    consolidated_hash = ""
+    try:
+        consolidated_text = consolidated.read_text(encoding="utf-8") if consolidated else ""
+        consolidated_hash = sha256_file(consolidated) if consolidated else ""
+        if consolidated_text != "".join(chunks):
+            errors.append("consolidated findings do not exactly match persona evidence")
+    except (OSError, UnicodeError) as exc:
+        errors.append(f"consolidated findings are unreadable: {exc}")
+    if state.get("evidence_sha256") != evidence_digest.hexdigest():
+        errors.append("state evidence_sha256 does not match generation evidence")
+    if state.get("consolidated_sha256") != consolidated_hash:
+        errors.append("state consolidated_sha256 does not match consolidated findings")
+
+    all_clean = len(coverage) == 5 and all(item["valid"] and item["classification"] == "clean" for item in coverage)
+    any_material = any(item["valid"] and item["classification"] == "material" for item in coverage)
+    phase, signal = state.get("phase"), state.get("decision_signal")
+    if not errors and phase == "done" and signal == "converged" and state.get("clean") == "true" and state.get("coverage_complete") == "true" and all_clean and state.get("converged_snapshot_sha256") == snapshot_hash:
+        outcome = "converged"
+        reason = "terminal sweep-v2 state and complete same-snapshot five-persona evidence prove convergence"
+    elif not errors and phase == "done" and signal == "max-reached" and state.get("clean") == "false" and state.get("coverage_complete") == "true" and generation == maximum and any_material and not all_clean and not state.get("converged_snapshot_sha256"):
+        outcome = "max_reached"
+        reason = "sweep-v2 reached its generation cap with authoritative material findings"
+    else:
+        outcome = "degraded"
+        mismatch = errors or [f"terminal/state verdict mismatch (phase={phase}, signal={signal}, clean={state.get('clean')}, coverage={state.get('coverage_complete')})"]
+        reason = "sweep-v2 evidence is incomplete or inconsistent: " + "; ".join(mismatch[:4])
+    return {
+        "outcome": outcome, "reason": reason, "state": state,
+        "generation": generation, "max_generations": maximum,
+        "snapshot_sha256": snapshot_hash or None,
+        "converged_snapshot_sha256": state.get("converged_snapshot_sha256") or None,
+        "persona_coverage": coverage, "severity_counts": severity,
+        "findings_status": "none" if all_clean else ("material" if any_material else "malformed"),
+        "generation_dir": generation_dir, "manifest": manifest_path,
+        "consolidated": consolidated, "errors": errors,
+    }
+
+
 def parse_claude_stream(path: Path) -> dict[str, Any]:
     summary: dict[str, Any] = {"result_records": 0, "reported_cost_usd": None, "session_id": None}
     try:
@@ -167,11 +474,13 @@ class JsonArgumentParser(argparse.ArgumentParser):
 
 
 def main() -> int:
+    global _PENDING_PLAN_RESTORE
     parser = JsonArgumentParser(description="Run a bounded headless Claudex review of an existing plan")
     parser.add_argument("--repo", required=True, help="absolute repository path")
     parser.add_argument("--plan", required=True, help="absolute path to an existing non-empty PLAN.md")
     parser.add_argument("--topic", required=True, help="self-contained review topic and constraints")
     parser.add_argument("--rounds", required=True, type=int, help="positive Claudex round limit")
+    parser.add_argument("--engine", choices=("sweep-v2", "legacy"), default="sweep-v2", help="plan-review engine (default: sweep-v2)")
     parser.add_argument("--timeout", required=True, type=float, help="wall-clock timeout in seconds")
     parser.add_argument("--budget-usd", required=True, help="positive Claude Code budget cap")
     default_plugin = Path(__file__).resolve().parents[1] / "plugins" / "claudex"
@@ -192,6 +501,8 @@ def main() -> int:
         codex = executable(args.codex, "--codex")
         if args.rounds < 1:
             raise ValueError("--rounds must be a positive integer")
+        if args.engine == "sweep-v2" and args.rounds > 5:
+            raise ValueError("sweep-v2 --rounds must be in 1..5 generations")
         if args.timeout <= 0:
             raise ValueError("--timeout must be positive")
         if not args.topic.strip():
@@ -203,6 +514,8 @@ def main() -> int:
         if not budget.is_finite() or budget <= 0:
             raise ValueError("--budget-usd must be a positive decimal")
         required = [plugin / ".claude-plugin" / "plugin.json", plugin / "commands" / "plan.md", plugin / "hooks" / "stop-hook.sh", plugin / "scripts" / "state-helpers.sh"]
+        if args.engine == "sweep-v2":
+            required.extend([plugin / "scripts" / "sweep-helpers.sh", plugin / "scripts" / "personas.sh"])
         missing = [str(path) for path in required if not path.is_file()]
         if missing:
             raise ValueError("invalid Claudex plugin root; missing: " + ", ".join(missing))
@@ -270,9 +583,11 @@ def main() -> int:
         shutil.copy2(runtime_plan, original_runtime_plan)
     shutil.copy2(plan, evidence / "PLAN.before.md")
     if external_plan:
+        _PENDING_PLAN_RESTORE = (runtime_plan, original_runtime_plan, original_runtime_plan.exists())
         shutil.copy2(plan, runtime_plan)
 
-    prompt = f"/claudex:plan --from-draft --skip-interview --rounds {args.rounds} {args.topic.strip()}"
+    engine_flag = "--engine sweep-v2 " if args.engine == "sweep-v2" else ""
+    prompt = f"/claudex:plan {engine_flag}--from-draft --skip-interview --rounds {args.rounds} {args.topic.strip()}"
     command = [
         str(claude), "--print", "--verbose", "--output-format", "stream-json", "--include-hook-events",
         "--dangerously-skip-permissions", "--setting-sources", "project", "--plugin-dir", str(plugin),
@@ -280,7 +595,7 @@ def main() -> int:
     ]
     metadata = {
         "argv": command, "cwd": str(repo), "timeout_seconds": args.timeout,
-        "budget_usd": str(budget), "rounds": args.rounds, "topic": args.topic,
+        "budget_usd": str(budget), "engine": args.engine, "rounds": args.rounds, "topic": args.topic,
         "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     (evidence / "run-metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
@@ -331,29 +646,48 @@ def main() -> int:
         shutil.copy2(runtime_plan, evidence / "PLAN.after.md")
         if external_plan:
             shutil.copy2(runtime_plan, plan)
-    if external_plan:
-        if original_runtime_plan.exists():
-            shutil.copy2(original_runtime_plan, runtime_plan)
-        else:
-            runtime_plan.unlink(missing_ok=True)
+    plan_restore_error = restore_pending_plan() if external_plan else None
 
     state = parse_state(selected_state) if selected_state else {}
     review_id = state.get("review_id")
+    valid_review_id = bool(review_id and re.fullmatch(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{6}", review_id))
+    state_identity_valid = bool(valid_review_id and selected_state and selected_state.stem == review_id)
     findings_files: list[Path] = []
-    if review_id:
-        findings_dir = state_dir / review_id
+    findings_dir: Path | None = None
+    evidence_state: Path | None = None
+    evidence_review_dir: Path | None = None
+    copy_errors: list[str] = []
+    if plan_restore_error:
+        copy_errors.append(f"repository PLAN.md restoration failed: {plan_restore_error}")
+    if state_identity_valid:
+        findings_dir = state_dir / str(review_id)
+
         def finding_round(path: Path) -> int:
             match = re.search(r"findings-round-(\d+)\.md$", path.name)
             return int(match.group(1)) if match else -1
+
         findings_files = sorted(findings_dir.glob("findings-round-*.md"), key=finding_round) if findings_dir.is_dir() else []
-        copy_if_exists(selected_state, evidence / "artifacts" / selected_state.name)
-        copy_if_exists(findings_dir, evidence / "artifacts" / review_id)
-    copy_if_exists(state_dir / "log", evidence / "artifacts" / "claudex.log")
+        if selected_state:
+            evidence_state = evidence / "artifacts" / selected_state.name
+            try:
+                copy_if_exists(selected_state, evidence_state)
+            except OSError as exc:
+                copy_errors.append(f"state evidence copy failed: {exc}")
+        evidence_review_dir = evidence / "artifacts" / str(review_id)
+        try:
+            copy_if_exists(findings_dir, evidence_review_dir)
+        except OSError as exc:
+            copy_errors.append(f"generation evidence copy failed: {exc}")
+    try:
+        copy_if_exists(state_dir / "log", evidence / "artifacts" / "claudex.log")
+    except OSError as exc:
+        copy_errors.append(f"log evidence copy failed: {exc}")
 
     final_findings = findings_files[-1] if findings_files else None
     findings_status, severity = final_findings_status(final_findings)
     phase = state.get("phase")
     decision = state.get("decision_signal")
+    sweep: dict[str, Any] | None = None
     if timed_out:
         outcome = "timed_out"
         reason = "wall-clock timeout exceeded; process group terminated and reaped"
@@ -363,15 +697,53 @@ def main() -> int:
     elif not selected_state or not state:
         outcome = "degraded"
         reason = "Claude exited zero but no new Claudex state artifact was found"
+    elif not state_identity_valid or findings_dir is None:
+        outcome = "degraded"
+        reason = "Claudex state filename and review_id are missing, malformed, or mismatched"
+    elif copy_errors:
+        outcome = "degraded"
+        reason = "required adapter evidence could not be copied: " + "; ".join(copy_errors)
+    elif args.engine == "sweep-v2":
+        sweep = validate_sweep(
+            evidence_state,
+            evidence_review_dir,
+            findings_dir,
+            runtime_plan,
+            evidence / "PLAN.after.md",
+            args.rounds,
+            args.topic.strip(),
+        )
+        state = sweep["state"]
+        phase = state.get("phase")
+        decision = state.get("decision_signal")
+        outcome = sweep["outcome"]
+        reason = sweep["reason"]
+        findings_status = sweep["findings_status"]
+        severity = sweep["severity_counts"]
     elif decision == "no-material-findings" and phase == "done" and findings_status == "none":
         outcome = "converged"
-        reason = "terminal state and final findings agree that no substantive findings remain"
+        reason = "terminal legacy state and final findings agree that no substantive findings remain"
     elif decision == "max-reached" and phase == "done" and findings_status in {"material", "unparseable"}:
         outcome = "max_reached"
-        reason = "round budget exhausted without an authoritative clean findings artifact"
+        reason = "legacy round budget exhausted without an authoritative clean findings artifact"
     else:
         outcome = "degraded"
-        reason = f"state/artifact mismatch or incomplete lifecycle (phase={phase}, signal={decision}, findings={findings_status})"
+        reason = f"legacy state/artifact mismatch or incomplete lifecycle (phase={phase}, signal={decision}, findings={findings_status})"
+
+    copied_final = None
+    if final_findings and evidence_review_dir:
+        copied_final = evidence_review_dir / final_findings.name
+    copied_consolidated = None
+    copied_manifest = None
+    copied_generation_dir = None
+    if sweep and evidence_review_dir and sweep.get("generation"):
+        generation_candidate = evidence_review_dir / "generations" / str(sweep["generation"])
+        if generation_candidate.is_dir():
+            copied_generation_dir = generation_candidate
+            consolidated_candidate = generation_candidate / "consolidated-findings.md"
+            manifest_candidate = generation_candidate / "manifest.json"
+            copied_consolidated = consolidated_candidate if consolidated_candidate.is_file() else None
+            copied_manifest = manifest_candidate if manifest_candidate.is_file() else None
 
     stream_summary = parse_claude_stream(stdout_path)
     result = {
@@ -379,20 +751,32 @@ def main() -> int:
         "outcome": outcome,
         "clean": outcome == "converged",
         "reason": reason,
+        "engine": args.engine,
         "repo": str(repo),
         "plan": str(plan),
         "review_id": review_id,
         "phase": phase,
         "decision_signal": decision,
-        "round": int(state["round"]) if state.get("round", "").isdigit() else None,
-        "max_rounds": int(state["max_rounds"]) if state.get("max_rounds", "").isdigit() else args.rounds,
+        "generation": sweep.get("generation") if sweep else None,
+        "max_generations": sweep.get("max_generations") if sweep else None,
+        "snapshot_sha256": sweep.get("snapshot_sha256") if sweep else None,
+        "converged_snapshot_sha256": sweep.get("converged_snapshot_sha256") if sweep else None,
+        "persona_coverage": sweep.get("persona_coverage", []) if sweep else [],
+        "generation_manifest": str(copied_manifest) if copied_manifest else None,
+        "generation_evidence_dir": str(copied_generation_dir) if copied_generation_dir else None,
+        "consolidated_findings": str(copied_consolidated) if copied_consolidated else None,
+        "round": int(state["round"]) if args.engine == "legacy" and state.get("round", "").isdigit() else None,
+        "max_rounds": int(state["max_rounds"]) if args.engine == "legacy" and state.get("max_rounds", "").isdigit() else (args.rounds if args.engine == "legacy" else None),
         "findings_status": findings_status,
         "severity_counts": severity,
         "final_findings": str(final_findings) if final_findings else None,
+        "evidence_final_findings": str(copied_final) if copied_final else None,
         "evidence_dir": str(evidence),
         "stdout_log": str(stdout_path),
         "stderr_log": str(stderr_path),
         "state_file": str(selected_state) if selected_state else None,
+        "evidence_state_file": str(evidence_state) if evidence_state else None,
+        "source_state_file": str(selected_state) if selected_state else None,
         "elapsed_seconds": elapsed,
         "process_exit_code": returncode,
         "budget_usd": str(budget),
@@ -404,4 +788,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        restore_error = restore_pending_plan()
+        message = f"unexpected adapter failure: {type(exc).__name__}: {exc}"
+        if restore_error:
+            message += f"; repository PLAN.md restoration also failed: {restore_error}"
+        sys.exit(fail(message, kind="internal"))
