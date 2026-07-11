@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import json
 import os
+import signal
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -437,6 +439,34 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         pid = int(marker.read_text())
         probe = subprocess.run(["kill", "-0", str(pid)], capture_output=True)
         self.assertNotEqual(probe.returncode, 0, f"child process {pid} survived timeout")
+
+    def test_external_sigterm_kills_child_group_and_emits_one_json_result(self):
+        marker = self.base / "signal-child.pid"
+        env = os.environ.copy()
+        env.update({"FAKE_CLAUDE_OUTCOME": "timeout", "FAKE_CHILD_PID_FILE": str(marker)})
+        command = [
+            str(ADAPTER), "--repo", str(self.repo.resolve()), "--plan", str(self.plan.resolve()),
+            "--topic", "review the grounded plan", "--rounds", "1", "--timeout", "30",
+            "--budget-usd", "1.25", "--plugin-root", str(PLUGIN.resolve()),
+            "--claude", str(self.claude.resolve()), "--codex", str(self.codex.resolve()),
+            "--engine", "sweep-v2",
+        ]
+        process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        deadline = time.monotonic() + 5
+        while not marker.is_file() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(marker.is_file(), "fake Claude child did not start")
+        process.send_signal(signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 124, stderr)
+        self.assertEqual(len(stdout.splitlines()), 1, stdout)
+        result = json.loads(stdout)
+        self.assertEqual(result["outcome"], "timed_out")
+        self.assertFalse(result["clean"])
+        self.assertIn("SIGTERM", result["reason"])
+        self.assertTrue(Path(result["evidence_dir"], "result.json").is_file())
+        probe = subprocess.run(["kill", "-0", marker.read_text().strip()], capture_output=True)
+        self.assertNotEqual(probe.returncode, 0, "Claude descendant survived adapter SIGTERM")
 
     def test_timeout_reports_validated_partial_sweep_progress_and_copies_evidence(self):
         marker = self.base / "partial-child.pid"

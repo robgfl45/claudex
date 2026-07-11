@@ -176,10 +176,19 @@ if [ -n "$RESUME_REVIEW_ID" ]; then
     echo "Resume refused: review lock is held." >&2
     exit 1
   fi
-  if [ -s "$ACTIVE_PGID_FILE" ] && kill -0 "$(cat "$ACTIVE_PGID_FILE" 2>/dev/null)" 2>/dev/null; then
-    echo "Resume refused: reviewer process is active." >&2
-    exit 1
+  ACTIVE_PGID=""
+  if [ -s "$ACTIVE_PGID_FILE" ]; then
+    ACTIVE_PGID=$(cat "$ACTIVE_PGID_FILE" 2>/dev/null)
   fi
+  case "$ACTIVE_PGID" in
+    ''|*[!0-9]*) ;;
+    *)
+      if kill -0 -- "-$ACTIVE_PGID" 2>/dev/null; then
+        echo "Resume refused: reviewer process group is active." >&2
+        exit 1
+      fi
+      ;;
+  esac
   rm -f "$LOCK_FILE" "$ACTIVE_PGID_FILE"
   PHASE=$(claudex_state_read_field "$STATE_FILE" phase)
   GENERATION=$(claudex_state_read_field "$STATE_FILE" generation)

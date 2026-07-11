@@ -475,6 +475,10 @@ check "stale unheld lock inode is accepted" bash -c "bash '$START' plan --engine
 printf '%s\n' "$$" > ".claude/claudex/$ID.lock"
 check "active held lock is rejected" bash -c "! bash '$START' plan --engine sweep-v2 --resume-review-id '$ID' --rounds 5 'deterministic sweep test' >/dev/null 2>&1"
 rm -f ".claude/claudex/$ID.lock"
+TEST_PGID=$(ps -o pgid= -p $$ | tr -d ' ')
+printf '%s\n' "$TEST_PGID" > ".claude/claudex/$ID-active-pgid"
+check "active reviewer process group is rejected" bash -c "! bash '$START' plan --engine sweep-v2 --resume-review-id '$ID' --rounds 5 'deterministic sweep test' >/dev/null 2>&1"
+rm -f ".claude/claudex/$ID-active-pgid"
 check "topic mismatch is rejected before resume" bash -c "! bash '$START' plan --engine sweep-v2 --resume-review-id '$ID' --rounds 5 'different topic' >/dev/null 2>&1"
 check "generation-cap mismatch is rejected before resume" bash -c "! bash '$START' plan --engine sweep-v2 --resume-review-id '$ID' --rounds 4 'deterministic sweep test' >/dev/null 2>&1"
 for terminal_phase in done cancelled errored; do

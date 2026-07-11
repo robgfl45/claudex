@@ -37,6 +37,34 @@ SWEEP_PERSONAS = [
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _PENDING_PLAN_RESTORE: tuple[Path, Path, bool] | None = None
 _PENDING_ADAPTER_LOCK: Path | None = None
+_INTERRUPTED_SIGNAL: int | None = None
+
+
+def record_interrupt(signum: int, _frame: Any) -> None:
+    """Defer external-signal cleanup to the normal supervision loop."""
+    global _INTERRUPTED_SIGNAL
+    _INTERRUPTED_SIGNAL = signum
+
+
+def terminate_process_group(process: subprocess.Popen[bytes], grace_seconds: float = 5) -> None:
+    """Idempotently terminate and reap the adapter-owned subprocess session."""
+    if process.poll() is not None:
+        process.wait()
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=grace_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait(timeout=grace_seconds)
 
 
 def restore_pending_plan() -> str | None:
@@ -734,8 +762,17 @@ def main() -> int:
     stdout_path = evidence / "claude-stream.jsonl"
     stderr_path = evidence / "claude-stderr.log"
     events_path = evidence / "state-events.jsonl"
+    global _INTERRUPTED_SIGNAL
+    _INTERRUPTED_SIGNAL = None
+    previous_signal_handlers = {
+        signal.SIGTERM: signal.getsignal(signal.SIGTERM),
+        signal.SIGINT: signal.getsignal(signal.SIGINT),
+    }
+    signal.signal(signal.SIGTERM, record_interrupt)
+    signal.signal(signal.SIGINT, record_interrupt)
     started = time.monotonic()
     timed_out = False
+    externally_interrupted = False
     process: subprocess.Popen[bytes] | None = None
     selected_state: Path | None = resume_state
     last_state: dict[str, str] | None = parse_state(resume_state) if resume_state else None
@@ -747,14 +784,13 @@ def main() -> int:
                 if new_states:
                     selected_state = max(new_states, key=lambda path: path.stat().st_mtime_ns)
                     last_state = snapshot_state(selected_state, events, last_state)
+                if _INTERRUPTED_SIGNAL is not None:
+                    externally_interrupted = True
+                    terminate_process_group(process)
+                    break
                 if time.monotonic() - started >= args.timeout:
                     timed_out = True
-                    os.killpg(process.pid, signal.SIGTERM)
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(process.pid, signal.SIGKILL)
-                        process.wait(timeout=5)
+                    terminate_process_group(process)
                     break
                 time.sleep(0.2)
             returncode = process.wait() if process.poll() is None else process.returncode
@@ -765,8 +801,7 @@ def main() -> int:
     except (OSError, subprocess.SubprocessError) as exc:
         if process is not None and process.poll() is None:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=5)
+                terminate_process_group(process)
             except (OSError, subprocess.SubprocessError):
                 pass
         returncode = process.returncode if process and process.returncode is not None else 125
@@ -819,7 +854,7 @@ def main() -> int:
     phase = state.get("phase")
     decision = state.get("decision_signal")
     sweep: dict[str, Any] | None = None
-    if timed_out:
+    if timed_out or externally_interrupted:
         if args.engine == "sweep-v2" and state_identity_valid and evidence_state and evidence_review_dir and not copy_errors:
             sweep = validate_sweep(
                 evidence_state, evidence_review_dir, findings_dir, runtime_plan,
@@ -831,7 +866,11 @@ def main() -> int:
             findings_status = sweep["findings_status"]
             severity = sweep["severity_counts"]
         outcome = "timed_out"
-        reason = "wall-clock timeout exceeded; process group terminated and reaped; latest copied sweep progress was revalidated"
+        if externally_interrupted:
+            signal_name = signal.Signals(_INTERRUPTED_SIGNAL).name if _INTERRUPTED_SIGNAL is not None else "UNKNOWN"
+            reason = f"adapter received {signal_name}; process group terminated and reaped; latest copied sweep progress was revalidated"
+        else:
+            reason = "wall-clock timeout exceeded; process group terminated and reaped; latest copied sweep progress was revalidated"
     elif returncode != 0:
         outcome = "failed"
         reason = f"Claude Code exited non-zero ({returncode})"
@@ -925,6 +964,8 @@ def main() -> int:
         "claude_session_id": stream_summary.get("session_id"),
     }
     (evidence / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    for handled_signal, previous_handler in previous_signal_handlers.items():
+        signal.signal(handled_signal, previous_handler)
     release_adapter_lock()
     return emit(result, EXIT_CODES[outcome])
 
