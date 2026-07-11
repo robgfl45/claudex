@@ -247,6 +247,43 @@ PY
   chmod a-w "$findings" "$result_file" 2>/dev/null || true
 }
 
+# Return 0 when an existing persona pair is complete and valid for this exact
+# immutable generation, 1 when neither artifact exists, and 2 for every
+# partial/invalid/contradictory case. Callers must never replace status 2.
+claudex_sweep_existing_result_status() {
+  local generation_dir="$1" persona="$2" expected="$3"
+  local findings="$generation_dir/$persona.findings.md"
+  local result="$generation_dir/$persona.result.json"
+  if [ ! -e "$findings" ] && [ ! -e "$result" ]; then
+    return 1
+  fi
+  [ -s "$findings" ] && [ -s "$result" ] || return 2
+  local classification
+  classification=$(claudex_sweep_validate_findings "$findings" 2>/dev/null) || return 2
+  [ "$classification" = clean ] || [ "$classification" = material ] || return 2
+  python3 - "$result" "$persona" "$expected" "$findings" "$classification" <<'PY'
+import datetime, hashlib, json, pathlib, sys
+path, persona, expected, findings_raw, classification = sys.argv[1:]
+findings = pathlib.Path(findings_raw)
+required = {"persona_id", "expected_snapshot_sha256", "actual_snapshot_sha256_before", "actual_snapshot_sha256_after", "codex_exit_code", "findings_path", "findings_sha256", "findings_classification", "completed_at"}
+try:
+    data = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    ok = isinstance(data, dict) and set(data) == required
+    ok &= data.get("persona_id") == persona
+    ok &= data.get("expected_snapshot_sha256") == expected
+    ok &= data.get("actual_snapshot_sha256_before") == expected
+    ok &= data.get("actual_snapshot_sha256_after") == expected
+    ok &= data.get("codex_exit_code") == 0
+    ok &= pathlib.Path(data.get("findings_path", "")).resolve() == findings.resolve()
+    ok &= data.get("findings_sha256") == hashlib.sha256(findings.read_bytes()).hexdigest()
+    ok &= data.get("findings_classification") == classification
+    datetime.datetime.strptime(str(data.get("completed_at")), "%Y-%m-%dT%H:%M:%SZ")
+except Exception:
+    ok = False
+raise SystemExit(0 if ok else 2)
+PY
+}
+
 claudex_sweep_consolidate() {
   local state_file="$1" review_id="$2" generation="$3" expected="$4" live_expected="$5"
   local generation_dir="$CLAUDEX_STATE_DIR/$review_id/generations/$generation"
@@ -436,6 +473,7 @@ GENERATION_DIR=$(printf '%q' "$generation_dir")
 SNAPSHOT=$(printf '%q' "$snapshot")
 PERSONA_TIMEOUT=$(printf '%q' "$CLAUDEX_SWEEP_PERSONA_TIMEOUT_SECONDS")
 ACTIVE_PGID_FILE=$(printf '%q' "$CLAUDEX_STATE_DIR/$review_id-active-pgid")
+RESUME_GUARD=$(printf '%q' "$CLAUDEX_STATE_DIR/$review_id.lock.resume-guard")
 source "\$CLAUDE_PLUGIN_ROOT/scripts/state-helpers.sh"
 source "\$CLAUDE_PLUGIN_ROOT/scripts/personas.sh"
 source "\$CLAUDE_PLUGIN_ROOT/scripts/sweep-helpers.sh"
@@ -487,17 +525,25 @@ finally:
 raise SystemExit(exit_code)
 PY
 }
-claudex_lock_write "\$CLAUDEX_STATE_DIR/\$REVIEW_ID.lock"
+claudex_lock_write "\$CLAUDEX_STATE_DIR/\$REVIEW_ID.lock" || exit 3
+rmdir "\$RESUME_GUARD" 2>/dev/null || true
 for persona in \$CLAUDEX_SWEEP_PERSONAS; do
   [ "\$(claudex_state_read_field "\$STATE_FILE" phase)" = cancelled ] && break
   findings="\$GENERATION_DIR/\$persona.findings.md"
   result="\$GENERATION_DIR/\$persona.result.json"
   prompt="\$GENERATION_DIR/.\$persona.prompt.txt"
-  if [ -e "\$findings" ] || [ -e "\$result" ]; then
+  claudex_sweep_existing_result_status "\$GENERATION_DIR" "\$persona" "\$EXPECTED"
+  existing_status=\$?
+  if [ "\$existing_status" -eq 0 ]; then
+    echo "[claudex] reusing validated generation evidence for \$persona"
+    claudex_state_set_field "\$STATE_FILE" sweep_heartbeat "\$persona"
+    continue
+  fi
+  if [ "\$existing_status" -ne 1 ]; then
     claudex_sweep_set_fields_atomic "\$STATE_FILE" \
       coverage_complete false decision_signal degraded clean false \
       revision_required false converged_snapshot_sha256 '' phase summarizing
-    echo "[claudex] refusing to replace existing generation evidence for \$persona" >&2
+    echo "[claudex] refusing to replace invalid existing generation evidence for \$persona" >&2
     exit 2
   fi
   rm -f "\$prompt"

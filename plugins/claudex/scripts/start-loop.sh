@@ -32,10 +32,12 @@ shift || true
 #   --interviewed      marker passed by the slash command after a successful interview;
 #                      records interview_used=true in state for status/audit
 #   --engine sweep-v2  use the opt-in frozen-snapshot five-persona engine
+#   --resume-review-id ID  resume one interrupted sweep-v2 review
 FROM_DRAFT=false
 CUSTOM_ROUNDS=""
 INTERVIEW_USED=false
 ENGINE="legacy"
+RESUME_REVIEW_ID=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --rounds)
@@ -65,6 +67,15 @@ while [ $# -gt 0 ]; do
       ;;
     --engine=*)
       ENGINE="${1#--engine=}"
+      shift
+      ;;
+    --resume-review-id)
+      shift
+      RESUME_REVIEW_ID="${1:-}"
+      shift || true
+      ;;
+    --resume-review-id=*)
+      RESUME_REVIEW_ID="${1#--resume-review-id=}"
       shift
       ;;
     *)
@@ -143,6 +154,136 @@ case "$MODE" in
 esac
 
 mkdir -p "$CLAUDEX_STATE_DIR" || exit 3
+
+# Resume is deliberately a separate fail-closed path. It binds to the exact
+# existing state/manifest identity and never creates a new generation itself.
+if [ -n "$RESUME_REVIEW_ID" ]; then
+  # shellcheck source=/dev/null
+  source "$CLAUDE_PLUGIN_ROOT/scripts/personas.sh" || exit 3
+  # shellcheck source=/dev/null
+  source "$CLAUDE_PLUGIN_ROOT/scripts/sweep-helpers.sh" || exit 3
+  if [ "$MODE" != plan ] || [ "$ENGINE" != sweep-v2 ] || [ -z "$CUSTOM_ROUNDS" ]; then
+    echo "--resume-review-id requires plan --engine sweep-v2 --rounds N." >&2
+    exit 2
+  fi
+  claudex_validate_review_id "$RESUME_REVIEW_ID" || { echo "Invalid resume review ID." >&2; exit 2; }
+  STATE_FILE="$CLAUDEX_STATE_DIR/$RESUME_REVIEW_ID.state"
+  REVIEW_DIR="$CLAUDEX_STATE_DIR/$RESUME_REVIEW_ID"
+  [ -f "$STATE_FILE" ] && [ -d "$REVIEW_DIR" ] || { echo "Resume state/evidence does not exist." >&2; exit 2; }
+  # Resume must preserve the repository-wide single-loop invariant. Ignore the
+  # target state itself, but refuse while any other nonterminal loop exists.
+  for OTHER_STATE in "$CLAUDEX_STATE_DIR"/*.state; do
+    [ -f "$OTHER_STATE" ] || continue
+    [ "$(basename "$OTHER_STATE" .state)" = "$RESUME_REVIEW_ID" ] && continue
+    OTHER_PHASE=$(claudex_state_read_field "$OTHER_STATE" phase)
+    case "$OTHER_PHASE" in
+      done|cancelled|errored|"") ;;
+      *)
+        echo "Resume refused: another claudex loop is active ($(basename "$OTHER_STATE" .state), phase: $OTHER_PHASE)." >&2
+        exit 1
+        ;;
+    esac
+  done
+  LOCK_FILE="$CLAUDEX_STATE_DIR/$RESUME_REVIEW_ID.lock"
+  RESUME_GUARD="${LOCK_FILE}.resume-guard"
+  if ! mkdir "$RESUME_GUARD" 2>/dev/null; then
+    echo "Resume refused: another resume owns the atomic guard (remove it manually only after proving no resume process exists)." >&2
+    exit 1
+  fi
+  trap 'rmdir "$RESUME_GUARD" 2>/dev/null || true' EXIT
+  ACTIVE_PGID_FILE="$CLAUDEX_STATE_DIR/$RESUME_REVIEW_ID-active-pgid"
+  if claudex_lock_is_active "$LOCK_FILE"; then
+    echo "Resume refused: review lock is held." >&2
+    exit 1
+  fi
+  ACTIVE_PGID=""
+  if [ -s "$ACTIVE_PGID_FILE" ]; then
+    ACTIVE_PGID=$(cat "$ACTIVE_PGID_FILE" 2>/dev/null)
+  fi
+  case "$ACTIVE_PGID" in
+    ''|*[!0-9]*) ;;
+    *)
+      if kill -0 -- "-$ACTIVE_PGID" 2>/dev/null; then
+        echo "Resume refused: reviewer process group is active." >&2
+        exit 1
+      fi
+      ;;
+  esac
+  rm -f "$LOCK_FILE" "$ACTIVE_PGID_FILE"
+  if ! (set -C; umask 077; printf '%s\n' "$$" > "$LOCK_FILE") 2>/dev/null; then
+    echo "Resume refused: another resume acquired the review lock." >&2
+    exit 1
+  fi
+  PHASE=$(claudex_state_read_field "$STATE_FILE" phase)
+  GENERATION=$(claudex_state_read_field "$STATE_FILE" generation)
+  SNAPSHOT_SHA=$(claudex_state_read_field "$STATE_FILE" snapshot_sha256)
+  STORED_TOPIC=$(claudex_state_read_field "$STATE_FILE" topic)
+  STORED_REPO=$(claudex_state_read_field "$STATE_FILE" repo_root)
+  STORED_ENGINE=$(claudex_state_read_field "$STATE_FILE" engine)
+  STORED_MODE=$(claudex_state_read_field "$STATE_FILE" mode)
+  STORED_MAX=$(claudex_state_read_field "$STATE_FILE" max_generations)
+  [ "$PHASE" = reviewing ] || [ "$PHASE" = awaiting-revision ] || { echo "Review phase is not resumable: $PHASE" >&2; exit 2; }
+  [ "$STORED_MODE" = plan ] && [ "$STORED_ENGINE" = sweep-v2 ] \
+    && [ "$STORED_REPO" = "$(pwd -P)" ] && [ "$STORED_TOPIC" = "$TOPIC" ] \
+    && [ "$STORED_MAX" = "$CUSTOM_ROUNDS" ] \
+    || { echo "Resume identity does not match mode/engine/repository/topic/generation cap." >&2; exit 2; }
+  GENERATION_DIR="$REVIEW_DIR/generations/$GENERATION"
+  python3 - "$STATE_FILE" "$GENERATION_DIR" "$GENERATION" "$SNAPSHOT_SHA" "$STORED_TOPIC" "$(pwd -P)/PLAN.md" <<'PY'
+import hashlib, json, pathlib, sys
+state, directory, generation, expected, topic, source = sys.argv[1:]
+root = pathlib.Path(directory)
+try:
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    required = {"generation", "snapshot_sha256", "required_persona_ids", "topic", "source_plan_path", "previous_generation_sha256"}
+    ids = ["architecture-scope", "security-data", "product-domain", "quality-accessibility-performance", "operations-deployment"]
+    ok = set(manifest) == required and manifest["generation"] == int(generation)
+    ok &= manifest["snapshot_sha256"] == expected and manifest["required_persona_ids"] == ids
+    ok &= manifest["topic"] == topic and manifest["source_plan_path"] == source
+    ok &= hashlib.sha256((root / "PLAN.md").read_bytes()).hexdigest() == expected
+    previous = None
+    for index in range(1, int(generation) + 1):
+        chain_root = root.parent / str(index)
+        chain = json.loads((chain_root / "manifest.json").read_text(encoding="utf-8"))
+        chain_hash = chain.get("snapshot_sha256")
+        ok &= set(chain) == required and chain.get("generation") == index
+        ok &= chain.get("previous_generation_sha256") == previous
+        ok &= chain.get("required_persona_ids") == ids and chain.get("topic") == topic
+        ok &= chain.get("source_plan_path") == source
+        ok &= hashlib.sha256((chain_root / "PLAN.md").read_bytes()).hexdigest() == chain_hash
+        ok &= previous is None or chain_hash != previous
+        previous = chain_hash
+except Exception:
+    ok = False
+raise SystemExit(0 if ok else 1)
+PY
+  if [ $? -ne 0 ]; then
+    claudex_sweep_set_fields_atomic "$STATE_FILE" decision_signal degraded clean false coverage_complete false phase summarizing
+    echo "Resume evidence identity is invalid; review degraded without overwrite." >&2
+    exit 3
+  fi
+  LIVE_SHA=$(claudex_sha256 PLAN.md 2>/dev/null)
+  if [ "$PHASE" = reviewing ] && [ "$LIVE_SHA" != "$SNAPSHOT_SHA" ]; then
+    claudex_sweep_set_fields_atomic "$STATE_FILE" decision_signal degraded clean false coverage_complete false phase summarizing
+    echo "Live PLAN.md changed during reviewing; review degraded." >&2
+    exit 3
+  fi
+  if [ "$PHASE" = reviewing ]; then
+    claudex_sweep_write_runner "$STATE_FILE" "$RESUME_REVIEW_ID" "$GENERATION" "$STORED_TOPIC" "$SNAPSHOT_SHA" || exit 3
+  fi
+  # Keep the guard across the slash-command/Stop-hook handoff. The generated
+  # runner removes it only after taking ownership with its live PID lock.
+  trap - EXIT
+  echo "Claudex sweep-v2 review resumed."
+  echo "Review ID: $RESUME_REVIEW_ID"
+  echo "Generation: $GENERATION of $STORED_MAX"
+  echo "Phase: $PHASE"
+  if [ "$PHASE" = reviewing ]; then
+    echo "End your turn. The Stop hook will provide the runner; it reuses only valid same-generation evidence."
+  else
+    echo "End your turn. The Stop hook will recover the pending revision from authoritative consolidated findings."
+  fi
+  exit 0
+fi
 
 # Sweep stale loops first (anything older than 15 min by default).
 claudex_sweep_stale

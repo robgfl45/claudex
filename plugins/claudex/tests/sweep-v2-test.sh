@@ -229,10 +229,14 @@ echo '{}' | bash "$HOOK" >/dev/null 2>&1
 check "post-run findings digest mismatch degrades before summary" test "$(field "$STATE" decision_signal)" = degraded
 
 new_repo; start_sweep
+ORDER="$TEST_DIR/rerun-order"; export CLAUDEX_SWEEP_ORDER_LOG="$ORDER"
 bash "$RUNNER" >/dev/null 2>&1
+BEFORE_DIGEST=$(shasum -a 256 ".claude/claudex/$ID/generations/1/"*.findings.md ".claude/claudex/$ID/generations/1/"*.result.json)
+: > "$ORDER"
 RERUN_RC=0
 bash "$RUNNER" >/dev/null 2>&1 || RERUN_RC=$?
-check "completed generation evidence is write-once" bash -c "[ '$RERUN_RC' -eq 2 ] && [ \"\$(sed -n 's/^decision_signal: *//p' '$STATE')\" = degraded ]"
+AFTER_DIGEST=$(shasum -a 256 ".claude/claudex/$ID/generations/1/"*.findings.md ".claude/claudex/$ID/generations/1/"*.result.json)
+check "valid completed generation evidence is reused without overwrite" bash -c "[ '$RERUN_RC' -eq 0 ] && [ ! -s '$ORDER' ] && [ '$BEFORE_DIGEST' = '$AFTER_DIGEST' ]"
 
 run_degraded_case() {
   local mode="$1" persona="$2" expected_name="$3"
@@ -411,6 +415,88 @@ SECOND_ID=$(basename "$(ls -t .claude/claudex/*.state | head -1)" .state)
 check "back-to-back sweep runs use isolated review IDs" test "$FIRST_ID" != "$SECOND_ID"
 check "back-to-back sweep keeps first generation artifacts" test -f ".claude/claudex/$FIRST_ID/generations/1/manifest.json"
 check "back-to-back sweep creates independent generation artifacts" test -f ".claude/claudex/$SECOND_ID/generations/1/manifest.json"
+
+printf '\n\033[1mInterruption recovery and resume\033[0m\n'
+for completed_count in 0 1 4; do
+  new_repo; start_sweep
+  export CLAUDEX_SWEEP_ORDER_LOG="$TEST_DIR/initial-order"
+  bash "$RUNNER" >/dev/null 2>&1
+  GEN_DIR=".claude/claudex/$ID/generations/1"
+  index=0
+  for persona in $CLAUDEX_SWEEP_PERSONAS; do
+    if [ "$index" -ge "$completed_count" ]; then
+      rm -f "$GEN_DIR/$persona.findings.md" "$GEN_DIR/$persona.result.json"
+    fi
+    index=$((index + 1))
+  done
+  rm -f "$GEN_DIR/consolidated-findings.md"
+  claudex_sweep_set_fields_atomic "$STATE" phase reviewing decision_signal none clean false coverage_complete false evidence_sha256 '' consolidated_sha256 '' converged_snapshot_sha256 ''
+  ORDER="$TEST_DIR/resume-order"; : > "$ORDER"; export CLAUDEX_SWEEP_ORDER_LOG="$ORDER"
+  RESUME_OUT=$(bash "$START" plan --engine sweep-v2 --resume-review-id "$ID" --rounds 5 "deterministic sweep test" 2>&1)
+  RUNNER=".claude/claudex/$ID-runner.sh"
+  bash "$RUNNER" >/dev/null 2>&1
+  EXPECTED_MISSING=$(printf '%s\n' $CLAUDEX_SWEEP_PERSONAS | tail -n "$((5 - completed_count))")
+  check "resume with $completed_count valid results runs only missing personas" test "$(cat "$ORDER")" = "$EXPECTED_MISSING"
+  check "resume with $completed_count valid results converges after full revalidation" bash -c "[ \"\$(sed -n 's/^decision_signal: *//p' '$STATE')\" = converged ] && [ \"\$(sed -n 's/^coverage_complete: *//p' '$STATE')\" = true ]"
+done
+
+new_repo; start_sweep
+bash "$RUNNER" >/dev/null 2>&1
+GEN_DIR=".claude/claudex/$ID/generations/1"
+BAD="$GEN_DIR/security-data.result.json"; chmod u+w "$BAD"
+python3 - "$BAD" <<'PY'
+import json, pathlib, sys
+p=pathlib.Path(sys.argv[1]); d=json.loads(p.read_text()); d['codex_exit_code']=9; p.write_text(json.dumps(d)+"\n")
+PY
+BAD_BEFORE=$(shasum -a 256 "$BAD")
+rm -f "$GEN_DIR/consolidated-findings.md"
+claudex_sweep_set_fields_atomic "$STATE" phase reviewing decision_signal none clean false coverage_complete false evidence_sha256 '' consolidated_sha256 '' converged_snapshot_sha256 ''
+bash "$START" plan --engine sweep-v2 --resume-review-id "$ID" --rounds 5 "deterministic sweep test" >/dev/null 2>&1
+bash ".claude/claudex/$ID-runner.sh" >/dev/null 2>&1
+BAD_AFTER=$(shasum -a 256 "$BAD")
+check "invalid existing evidence degrades and is not overwritten" bash -c "[ '$BAD_BEFORE' = '$BAD_AFTER' ] && [ \"\$(sed -n 's/^decision_signal: *//p' '$STATE')\" = degraded ]"
+
+new_repo; start_sweep
+export CLAUDEX_SWEEP_STUB_MODE=material CLAUDEX_SWEEP_STUB_PERSONA=architecture-scope
+bash "$RUNNER" >/dev/null 2>&1
+GEN1_SHA=$(field "$STATE" snapshot_sha256)
+unset CLAUDEX_SWEEP_STUB_MODE CLAUDEX_SWEEP_STUB_PERSONA
+RESUME_OUT=$(bash "$START" plan --engine sweep-v2 --resume-review-id "$ID" --rounds 5 "deterministic sweep test" 2>&1)
+HOOK_OUT=$(echo '{}' | bash "$HOOK" 2>/dev/null)
+check "awaiting-revision resumes before plan change" bash -c "printf '%s' '$RESUME_OUT' | grep -q 'Phase: awaiting-revision' && printf '%s' '$HOOK_OUT' | grep -q 'revise live'"
+printf '\n2. Address finding.\n\n## Changelog\n### Sweep generation 1 — %s\n- Accepted [architecture-scope-high-1]: added scoped failure handling.\n' "$GEN1_SHA" >> PLAN.md
+RESUME_OUT=$(bash "$START" plan --engine sweep-v2 --resume-review-id "$ID" --rounds 5 "deterministic sweep test" 2>&1)
+echo '{}' | bash "$HOOK" >/dev/null 2>&1
+check "awaiting-revision resumes after valid plan change and creates next generation" bash -c "[ \"\$(sed -n 's/^generation: *//p' '$STATE')\" = 2 ] && [ \"\$(sed -n 's/^phase: *//p' '$STATE')\" = reviewing ]"
+
+new_repo; start_sweep
+OTHER_ID="20990101-010101-abcdef"
+cp "$STATE" ".claude/claudex/$OTHER_ID.state"
+sed -i.bak "s/^review_id:.*/review_id: $OTHER_ID/" ".claude/claudex/$OTHER_ID.state"; rm -f ".claude/claudex/$OTHER_ID.state.bak"
+check "another active review blocks resume" bash -c "! bash '$START' plan --engine sweep-v2 --resume-review-id '$ID' --rounds 5 'deterministic sweep test' >/dev/null 2>&1"
+rm -f ".claude/claudex/$OTHER_ID.state"
+mkdir ".claude/claudex/$ID.lock.resume-guard"
+check "atomic resume guard rejects concurrent resume" bash -c "! bash '$START' plan --engine sweep-v2 --resume-review-id '$ID' --rounds 5 'deterministic sweep test' >/dev/null 2>&1"
+rmdir ".claude/claudex/$ID.lock.resume-guard"
+rm -f ".claude/claudex/$ID.lock"; printf '999999\n' > ".claude/claudex/$ID.lock"
+check "stale unheld lock inode is accepted" bash -c "bash '$START' plan --engine sweep-v2 --resume-review-id '$ID' --rounds 5 'deterministic sweep test' >/dev/null 2>&1"
+check "successful resume keeps guard through runner handoff" test -d ".claude/claudex/$ID.lock.resume-guard"
+check "second resume is rejected during runner handoff" bash -c "! bash '$START' plan --engine sweep-v2 --resume-review-id '$ID' --rounds 5 'deterministic sweep test' >/dev/null 2>&1"
+check "generated runner releases guard only after live lock" bash -c "grep -q 'claudex_lock_write' '.claude/claudex/$ID-runner.sh' && grep -q 'rmdir.*RESUME_GUARD' '.claude/claudex/$ID-runner.sh'"
+rmdir ".claude/claudex/$ID.lock.resume-guard"
+printf '%s\n' "$$" > ".claude/claudex/$ID.lock"
+check "active held lock is rejected" bash -c "! bash '$START' plan --engine sweep-v2 --resume-review-id '$ID' --rounds 5 'deterministic sweep test' >/dev/null 2>&1"
+rm -f ".claude/claudex/$ID.lock"
+TEST_PGID=$(ps -o pgid= -p $$ | tr -d ' ')
+printf '%s\n' "$TEST_PGID" > ".claude/claudex/$ID-active-pgid"
+check "active reviewer process group is rejected" bash -c "! bash '$START' plan --engine sweep-v2 --resume-review-id '$ID' --rounds 5 'deterministic sweep test' >/dev/null 2>&1"
+rm -f ".claude/claudex/$ID-active-pgid"
+check "topic mismatch is rejected before resume" bash -c "! bash '$START' plan --engine sweep-v2 --resume-review-id '$ID' --rounds 5 'different topic' >/dev/null 2>&1"
+check "generation-cap mismatch is rejected before resume" bash -c "! bash '$START' plan --engine sweep-v2 --resume-review-id '$ID' --rounds 4 'deterministic sweep test' >/dev/null 2>&1"
+for terminal_phase in done cancelled errored; do
+  claudex_sweep_set_fields_atomic "$STATE" phase "$terminal_phase"
+  check "terminal $terminal_phase state is not resumable" bash -c "! bash '$START' plan --engine sweep-v2 --resume-review-id '$ID' --rounds 5 'deterministic sweep test' >/dev/null 2>&1"
+done
 
 printf '\n\033[1m=== Sweep-v2 Results ===\033[0m\n'
 printf '  \033[32m%d passed\033[0m\n' "$PASS"

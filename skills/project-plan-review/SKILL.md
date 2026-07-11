@@ -19,7 +19,7 @@ Use this workflow for substantial features, migrations, or risky cross-cutting w
 3. Read [the delegation runbook](references/runbook.md).
 4. Use the adapter's default `sweep-v2` engine with `--rounds 5`. The command must invoke `/claudex:plan --engine sweep-v2 --from-draft --skip-interview --rounds 5 ...` through the adapter.
 5. Call `delegate_task` with self-contained context and absolute paths for the repository, `PLAN.md`, adapter, plugin, Claude, Codex, and evidence directory. The child is a leaf: it cannot ask Rob questions or delegate further.
-6. Keep the main Drake session responsive while the child performs the bounded run. The outer child timeout must reserve at least 180 seconds beyond the adapter timeout for artifact read-back and reporting.
+6. Keep the main Drake session responsive while the child performs the bounded run. Standard five-generation runs use a 3,600-second adapter timeout and an outer child timeout of at least 4,200 seconds. For any non-standard timeout, the outer child must still exceed the adapter by at least 300 seconds for artifact read-back and reporting.
 7. On return, read `result.json`, the copied `evidence_state_file`, generation manifest, consolidated findings, and all five persona sidecars/findings from adapter evidence. A claimed path is not evidence until read.
 8. Independently reject scope creep, invented contracts, and recommendations unsupported by the grounded repository. Claudex is a critic, not the product owner.
 9. Normalize the plan so only the active implementation phase remains; remove completed prerequisites, historical phases, and stale branching instructions.
@@ -37,6 +37,8 @@ A clean result requires all of the following from authoritative state and artifa
 - consolidated findings proving that all five personas returned exactly no substantive findings.
 
 Generation five with material findings is `max_reached` and non-clean. Missing, malformed, mutated, hash-mismatched, nonzero, cancelled, degraded, or incomplete evidence is never clean.
+
+After an interruption, resume first with the same review ID, repository, canonical plan path, exact topic, engine, and five-generation cap, and always provide a **new empty evidence directory** for the resumed adapter invocation. Resume only `reviewing` or `awaiting-revision`; never carry approval or persona evidence across a plan generation/hash change.
 
 ## Boundaries and outcome rules
 
