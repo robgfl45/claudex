@@ -14,6 +14,23 @@
 #   claudex_persona_label_for_round <round>
 #     Prints a one-line label for BLOCK headers (e.g. "Security review").
 
+# sweep-v2 uses complete coverage on every generation. Keep these IDs in one
+# stable order because runner execution, consolidation, and convergence all
+# depend on it.
+CLAUDEX_SWEEP_PERSONAS="architecture-scope security-data product-domain quality-accessibility-performance operations-deployment"
+
+claudex_sweep_persona_prompt() {
+  local persona="$1"
+  case "$persona" in
+    architecture-scope) printf '%s' 'Review architecture, scope boundaries, dependencies, compatibility, and whether the plan solves the stated problem without hidden design gaps.' ;;
+    security-data) printf '%s' 'Review authorization, input boundaries, secrets, privacy, concurrency, idempotency, recovery, and data integrity.' ;;
+    product-domain) printf '%s' 'Review product behavior, domain rules, user journeys, acceptance criteria, and credible business edge cases.' ;;
+    quality-accessibility-performance) printf '%s' 'Review test strategy, accessibility, performance, resource bounds, failure visibility, and quality gates proportionate to the change.' ;;
+    operations-deployment) printf '%s' 'Review rollout, rollback, migrations, observability, operational ownership, version skew, and deployment failure modes.' ;;
+    *) return 1 ;;
+  esac
+}
+
 claudex_persona_label_for_round() {
   local r="${1:-1}"
   case "$r" in

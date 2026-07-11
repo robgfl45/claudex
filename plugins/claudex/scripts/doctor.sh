@@ -3,7 +3,7 @@
 #
 # Verifies that everything claudex needs is wired up correctly:
 #   - bash version
-#   - python3 (for JSON escape; sed fallback exists but python3 is preferred)
+#   - python3 (required for sweep-v2 manifests and artifact validation)
 #   - codex CLI installed and responding
 #   - .claude/claudex writable
 #   - plugin file integrity (every expected script + prompt template present)
@@ -11,7 +11,6 @@
 #   - stale loops report (informational, not fatal)
 #
 # Exits 0 if every required check passes, 1 if any required check fails.
-# Optional checks (e.g. python3) only print warnings.
 
 set +e
 
@@ -82,8 +81,9 @@ if command -v codex >/dev/null 2>&1; then
   fi
 fi
 
-section "Optional dependencies"
-warn_check "python3 (used for JSON escape; sed fallback works)" command -v python3
+section "Required runtime dependencies"
+check "python3 (required for sweep-v2 manifests and validation)" command -v python3
+check "SHA-256 implementation (shasum or sha256sum)" bash -c 'command -v shasum >/dev/null 2>&1 || command -v sha256sum >/dev/null 2>&1'
 
 section "State directory"
 mkdir -p "$CLAUDEX_STATE_DIR" 2>/dev/null
@@ -96,6 +96,7 @@ PLUGIN_FILES=(
   "hooks/hooks.json"
   "scripts/state-helpers.sh"
   "scripts/personas.sh"
+  "scripts/sweep-helpers.sh"
   "scripts/start-loop.sh"
   "scripts/cancel-loop.sh"
   "scripts/rollback-loop.sh"
@@ -140,6 +141,8 @@ check "state-helpers source cleanly" \
   bash -c "source '$CLAUDE_PLUGIN_ROOT/scripts/state-helpers.sh'"
 check "personas source cleanly" \
   bash -c "source '$CLAUDE_PLUGIN_ROOT/scripts/personas.sh'"
+check "sweep helpers source cleanly" \
+  bash -c "source '$CLAUDE_PLUGIN_ROOT/scripts/sweep-helpers.sh'"
 if source "$CLAUDE_PLUGIN_ROOT/scripts/personas.sh" 2>/dev/null; then
   R1=$(claudex_persona_for_round 1)
   R2=$(claudex_persona_for_round 2)

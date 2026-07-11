@@ -31,9 +31,11 @@ shift || true
 #                      command; accepted here as a no-op so it's safe to pass through)
 #   --interviewed      marker passed by the slash command after a successful interview;
 #                      records interview_used=true in state for status/audit
+#   --engine sweep-v2  use the opt-in frozen-snapshot five-persona engine
 FROM_DRAFT=false
 CUSTOM_ROUNDS=""
 INTERVIEW_USED=false
+ENGINE="legacy"
 while [ $# -gt 0 ]; do
   case "$1" in
     --rounds)
@@ -54,6 +56,15 @@ while [ $# -gt 0 ]; do
       ;;
     --interviewed)
       INTERVIEW_USED=true
+      shift
+      ;;
+    --engine)
+      shift
+      ENGINE="${1:-}"
+      shift || true
+      ;;
+    --engine=*)
+      ENGINE="${1#--engine=}"
       shift
       ;;
     *)
@@ -96,8 +107,34 @@ case "$MODE" in
       echo "Plan mode requires a topic. Usage: start-loop.sh plan <topic>" >&2
       exit 2
     fi
+    if [ "$ENGINE" != "legacy" ] && [ "$ENGINE" != "sweep-v2" ]; then
+      echo "Unknown plan engine: $ENGINE. Use sweep-v2 or omit --engine for legacy mode." >&2
+      exit 2
+    fi
+    if [ "$ENGINE" = "sweep-v2" ]; then
+      if ! command -v python3 >/dev/null 2>&1; then
+        echo "--engine sweep-v2 requires python3 for manifests and artifact validation." >&2
+        exit 2
+      fi
+      if ! command -v shasum >/dev/null 2>&1 && ! command -v sha256sum >/dev/null 2>&1; then
+        echo "--engine sweep-v2 requires shasum or sha256sum for SHA-256 verification." >&2
+        exit 2
+      fi
+      if [ ! -s "PLAN.md" ]; then
+        echo "--engine sweep-v2 requires an existing non-empty PLAN.md." >&2
+        exit 2
+      fi
+      if [ -n "$CUSTOM_ROUNDS" ] && [ "$CUSTOM_ROUNDS" -gt 5 ]; then
+        echo "sweep-v2 has a hard maximum of five generations." >&2
+        exit 2
+      fi
+    fi
     ;;
   review)
+    if [ "$ENGINE" != "legacy" ]; then
+      echo "--engine only applies to plan mode." >&2
+      exit 2
+    fi
     ;;
   *)
     echo "Unknown mode: $MODE. Use plan or review." >&2
@@ -148,16 +185,25 @@ MAX_PLAN_ROUNDS="${CLAUDEX_MAX_PLAN_ROUNDS:-3}"
 MAX_REVIEW_ROUNDS="${CLAUDEX_MAX_REVIEW_ROUNDS:-3}"
 
 if [ "$MODE" = "plan" ]; then
-  MAX_ROUNDS="$MAX_PLAN_ROUNDS"
-  PHASE="drafting"
+  if [ "$ENGINE" = "sweep-v2" ]; then
+    MAX_ROUNDS=5
+    PHASE="reviewing"
+  else
+    MAX_ROUNDS="$MAX_PLAN_ROUNDS"
+    PHASE="drafting"
+  fi
 else
   MAX_ROUNDS="$MAX_REVIEW_ROUNDS"
   PHASE="reviewing"
 fi
 
-# --rounds flag overrides default max.
+# --rounds flag overrides default max (sweep-v2 validated at five or fewer).
 if [ -n "$CUSTOM_ROUNDS" ]; then
   MAX_ROUNDS="$CUSTOM_ROUNDS"
+fi
+MAX_GENERATIONS=""
+if [ "$ENGINE" = "sweep-v2" ]; then
+  MAX_GENERATIONS="$MAX_ROUNDS"
 fi
 
 # Escape topic for YAML (basic; topic is user-provided).
@@ -182,12 +228,50 @@ started_at_epoch: $NOW_EPOCH
 last_updated_at: $NOW
 decision_signal: none"
 
+if [ "$ENGINE" = "sweep-v2" ]; then
+  STATE_CONTENT="$STATE_CONTENT
+engine: sweep-v2
+generation: 1
+max_generations: $MAX_GENERATIONS
+snapshot_sha256:
+coverage_complete: false
+clean: false
+revision_required: false"
+fi
+
 claudex_state_write "$STATE_FILE" "$STATE_CONTENT" || exit 3
 claudex_lock_write "$LOCK_FILE" || exit 3
+
+if [ "$ENGINE" = "sweep-v2" ]; then
+  # shellcheck source=/dev/null
+  source "$CLAUDE_PLUGIN_ROOT/scripts/personas.sh" || exit 3
+  # shellcheck source=/dev/null
+  source "$CLAUDE_PLUGIN_ROOT/scripts/sweep-helpers.sh" || exit 3
+  SNAPSHOT_SHA=$(claudex_sweep_create_generation "$STATE_FILE" "$REVIEW_ID" 1 "$TOPIC" "") || {
+    claudex_state_set_field "$STATE_FILE" phase errored
+    echo "Failed to create immutable sweep-v2 generation 1 snapshot." >&2
+    exit 3
+  }
+  claudex_sweep_write_runner "$STATE_FILE" "$REVIEW_ID" 1 "$TOPIC" "$SNAPSHOT_SHA" || {
+    claudex_state_set_field "$STATE_FILE" phase errored
+    echo "Failed to create sweep-v2 runner." >&2
+    exit 3
+  }
+fi
 
 # Print initial instructions to stdout. Claude will read these.
 case "$MODE" in
   plan)
+    if [ "$ENGINE" = "sweep-v2" ]; then
+      echo "Claudex sweep-v2 plan review initialized."
+      echo "Review ID: $REVIEW_ID"
+      echo "Topic: $TOPIC"
+      echo "Generation: 1 of $MAX_GENERATIONS"
+      echo "Snapshot SHA-256: $SNAPSHOT_SHA"
+      echo "Frozen snapshot: $CLAUDEX_STATE_DIR/$REVIEW_ID/generations/1/PLAN.md"
+      echo "End your turn. The Stop hook will provide the deterministic sequential runner command."
+      exit 0
+    fi
     echo "Claudex plan mode initialized."
     echo "Review ID: $REVIEW_ID"
     echo "Topic: $TOPIC"

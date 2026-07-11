@@ -165,6 +165,8 @@ unset CLAUDEX_STATE_DIR
 section "12. Personas helper"
 check "personas.sh exists" test -f "$PLUGIN_ROOT/scripts/personas.sh"
 check "personas sources cleanly" bash -c "source '$PLUGIN_ROOT/scripts/personas.sh'"
+check "sweep-helpers.sh exists" test -f "$PLUGIN_ROOT/scripts/sweep-helpers.sh"
+check "sweep helpers source cleanly" bash -c "source '$PLUGIN_ROOT/scripts/sweep-helpers.sh'"
 
 # shellcheck source=/dev/null
 source "$PLUGIN_ROOT/scripts/personas.sh"
@@ -188,6 +190,9 @@ L3=$(claudex_persona_label_for_round 3)
 check "round 1 label non-empty" test -n "$L1"
 check "round 1 label differs from round 2" test "$L1" != "$L2"
 check "round 2 label differs from round 3" test "$L2" != "$L3"
+SWEEP_IDS=$(printf '%s\n' $CLAUDEX_SWEEP_PERSONAS)
+check "sweep-v2 defines exactly five personas" test "$(printf '%s\n' "$SWEEP_IDS" | wc -l | tr -d ' ')" = 5
+check "sweep-v2 persona order is stable" test "$SWEEP_IDS" = "$(printf '%s\n' architecture-scope security-data product-domain quality-accessibility-performance operations-deployment)"
 
 section "13. Findings severity counter"
 TMP=$(mktemp -d)
