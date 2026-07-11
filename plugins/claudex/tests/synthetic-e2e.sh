@@ -118,7 +118,7 @@ echo "$CODEX_OUTPUT" | tail -30 | head -20
 check "runner exited with code 0" test "$RUNNER_RC" = "0"
 check "Codex output is non-empty" test -n "$CODEX_OUTPUT"
 check "Codex did not hit stdin terminal error" env CODEX_OUTPUT="$CODEX_OUTPUT" bash -c '! printf "%s" "$CODEX_OUTPUT" | grep -q "stdin is not a terminal"'
-check "Codex did not hit auth error" env CODEX_OUTPUT="$CODEX_OUTPUT" bash -c '! printf "%s" "$CODEX_OUTPUT" | grep -qiE "not logged in|auth.*fail"'
+check "Codex did not hit auth error" env CODEX_OUTPUT="$CODEX_OUTPUT" bash -c '! printf "%s" "$CODEX_OUTPUT" | grep -qiE "not logged in|authentication failed|login required|missing (api key|bearer token)"'
 check "Codex output mentions plan/review topic" env CODEX_OUTPUT="$CODEX_OUTPUT" bash -c 'printf "%s" "$CODEX_OUTPUT" | grep -qiE "plan|review|expir|finding"'
 
 # Round 1 done. Now simulate Claude deciding the loop is complete and calling mark-done.

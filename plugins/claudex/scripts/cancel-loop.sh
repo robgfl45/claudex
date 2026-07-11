@@ -16,14 +16,25 @@ fi
 
 REVIEW_ID=$(basename "$ACTIVE" .state)
 echo "Cancelling loop: $REVIEW_ID"
-
-claudex_state_set_field "$ACTIVE" "phase" "cancelled"
-claudex_state_set_field "$ACTIVE" "last_updated_at" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+ENGINE=$(claudex_state_read_field "$ACTIVE" engine)
+if [ "$ENGINE" = "sweep-v2" ]; then
+  # Share the same advisory write lock as verdict persistence so cancellation
+  # cannot be overwritten by a racing whole-state replacement.
+  # shellcheck source=/dev/null
+  source "$CLAUDE_PLUGIN_ROOT/scripts/sweep-helpers.sh"
+  claudex_sweep_set_fields_atomic "$ACTIVE" \
+    phase cancelled decision_signal cancelled clean false revision_required false || {
+      echo "Could not persist cancellation." >&2
+      exit 1
+    }
+else
+  claudex_state_set_field "$ACTIVE" "phase" "cancelled"
+  claudex_state_set_field "$ACTIVE" "last_updated_at" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+fi
 
 # sweep-v2 runs each Codex reviewer in its own process group. Terminate the
 # active group before removing artifacts so cancellation cannot leave an
 # orphan reviewer writing into a cancelled generation.
-ENGINE=$(claudex_state_read_field "$ACTIVE" engine)
 ACTIVE_PGID_FILE="$CLAUDEX_STATE_DIR/$REVIEW_ID-active-pgid"
 if [ "$ENGINE" = "sweep-v2" ] && [ -f "$ACTIVE_PGID_FILE" ]; then
   ACTIVE_PGID=$(cat "$ACTIVE_PGID_FILE" 2>/dev/null)

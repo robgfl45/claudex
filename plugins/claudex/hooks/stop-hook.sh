@@ -246,6 +246,9 @@ Do not edit the snapshot or live \`PLAN.md\` while it runs. When it finishes, en
       else
         RECONCILIATION_RC=$?
       fi
+      if [ "$(claudex_state_read_field "$ACTIVE_STATE" phase)" = cancelled ]; then
+        approve "sweep-v2 cancelled during evidence revalidation"
+      fi
       if [ "$RECONCILIATION_RC" -ne 1 ]; then
         block "Sweep-v2 could not revalidate generation-$GENERATION evidence before accepting the revision. The generation is degraded and cannot advance; end your turn for the terminal summary or cancel the loop."
       fi
@@ -311,6 +314,9 @@ When the runner finishes, end your turn."
         REVALIDATE_RC=0
       else
         REVALIDATE_RC=$?
+      fi
+      if [ "$(claudex_state_read_field "$ACTIVE_STATE" phase)" = cancelled ]; then
+        approve "sweep-v2 cancelled during terminal revalidation"
       fi
       case "$REVALIDATE_RC" in
         0|2|3) ;;

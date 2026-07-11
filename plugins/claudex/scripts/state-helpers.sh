@@ -148,7 +148,7 @@ claudex_sweep_stale() {
     if [ "$engine" = "sweep-v2" ] && ! find "$f" -prune -mmin "+$CLAUDEX_SWEEP_V2_STALE_MINUTES" -print 2>/dev/null | grep -q .; then
       continue
     fi
-    rm -f "$f" "$CLAUDEX_STATE_DIR/${id}.lock" "$CLAUDEX_STATE_DIR/${id}-runner.sh" "$CLAUDEX_STATE_DIR/${id}-prompt.txt" "$CLAUDEX_STATE_DIR/${id}-active-pgid" 2>/dev/null
+    rm -f "$f" "$CLAUDEX_STATE_DIR/${id}.lock" "$CLAUDEX_STATE_DIR/${id}-runner.sh" "$CLAUDEX_STATE_DIR/${id}-prompt.txt" "$CLAUDEX_STATE_DIR/${id}-active-pgid" "$CLAUDEX_STATE_DIR/${id}.state.write-lock" 2>/dev/null
     rm -rf "$CLAUDEX_STATE_DIR/${id}" 2>/dev/null
   done
   return 0

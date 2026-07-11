@@ -20,41 +20,57 @@ claudex_sha256() {
 claudex_sweep_set_fields_atomic() {
   local state_file="$1"
   shift
+  local expected_phase=""
+  if [ "${1:-}" = "--expect-phase" ]; then
+    expected_phase="${2:-}"
+    shift 2
+  fi
   [ $(( $# % 2 )) -eq 0 ] || return 2
-  python3 - "$state_file" "$@" <<'PY'
-import datetime, os, pathlib, re, sys, tempfile
+  python3 - "$state_file" "$expected_phase" "$@" <<'PY'
+import datetime, fcntl, os, pathlib, re, sys, tempfile
 
 path = pathlib.Path(sys.argv[1])
-args = sys.argv[2:]
+expected_phase = sys.argv[2]
+args = sys.argv[3:]
 updates = dict(zip(args[::2], args[1::2]))
 if not updates or any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) for key in updates):
     raise SystemExit(2)
 updates.setdefault("last_updated_at", datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"))
-lines = path.read_text(encoding="utf-8").splitlines()
-seen = set()
-out = []
-for line in lines:
-    key = line.split(":", 1)[0] if ":" in line else ""
-    if key in updates:
-        out.append(f"{key}: {updates[key]}")
-        seen.add(key)
-    else:
-        out.append(line)
-for key, value in updates.items():
-    if key not in seen:
-        out.append(f"{key}: {value}")
-fd, tmp = tempfile.mkstemp(prefix=path.name + ".tmp.", dir=path.parent)
-try:
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write("\n".join(out) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, path)
-finally:
+lock_path = path.with_name(path.name + ".write-lock")
+with lock_path.open("a+", encoding="utf-8") as lock:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    current = {}
+    for line in lines:
+        if ":" in line:
+            key, value = line.split(":", 1)
+            current.setdefault(key, value.strip())
+    if expected_phase and current.get("phase") != expected_phase:
+        raise SystemExit(3)
+    seen = set()
+    out = []
+    for line in lines:
+        key = line.split(":", 1)[0] if ":" in line else ""
+        if key in updates:
+            out.append(f"{key}: {updates[key]}")
+            seen.add(key)
+        else:
+            out.append(line)
+    for key, value in updates.items():
+        if key not in seen:
+            out.append(f"{key}: {value}")
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".tmp.", dir=path.parent)
     try:
-        os.unlink(tmp)
-    except FileNotFoundError:
-        pass
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(out) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 PY
 }
 
@@ -236,6 +252,10 @@ claudex_sweep_consolidate() {
   local generation_dir="$CLAUDEX_STATE_DIR/$review_id/generations/$generation"
   local consolidated="$generation_dir/consolidated-findings.md"
   local snapshot="$generation_dir/PLAN.md"
+  local verdict_phase
+  verdict_phase=$(claudex_state_read_field "$state_file" phase)
+  [ "$verdict_phase" = cancelled ] && return 130
+  case "$verdict_phase" in reviewing|awaiting-revision|summarizing) ;; *) return 4 ;; esac
   local current_snapshot current_live
   current_snapshot=$(claudex_sha256 "$snapshot" 2>/dev/null)
   current_live=$(claudex_sha256 PLAN.md 2>/dev/null)
@@ -249,7 +269,7 @@ claudex_sweep_consolidate() {
     if [ -z "$stored_evidence" ] || [ -z "$stored_consolidated" ] \
       || [ "$current_evidence" != "$stored_evidence" ] \
       || [ "$current_consolidated" != "$stored_consolidated" ]; then
-      claudex_sweep_set_fields_atomic "$state_file" \
+      claudex_sweep_set_fields_atomic "$state_file" --expect-phase "$verdict_phase" \
         coverage_complete false \
         decision_signal degraded \
         clean false \
@@ -341,7 +361,7 @@ PY
   if [ "$clean_count" -ne 5 ] && [ "$material" != "true" ]; then degraded=true; fi
 
   if [ "$degraded" = "true" ]; then
-    claudex_sweep_set_fields_atomic "$state_file" \
+    claudex_sweep_set_fields_atomic "$state_file" --expect-phase "$verdict_phase" \
       coverage_complete false \
       decision_signal degraded \
       clean false \
@@ -353,7 +373,7 @@ PY
     return 2
   fi
   if [ "$clean_count" -eq 5 ] && [ "$material" = "false" ]; then
-    claudex_sweep_set_fields_atomic "$state_file" \
+    claudex_sweep_set_fields_atomic "$state_file" --expect-phase "$verdict_phase" \
       coverage_complete true \
       decision_signal converged \
       clean true \
@@ -369,7 +389,7 @@ PY
   case "$max_generations" in ''|*[!0-9]*) max_generations="$CLAUDEX_SWEEP_MAX_GENERATIONS" ;; esac
   [ "$max_generations" -le "$CLAUDEX_SWEEP_MAX_GENERATIONS" ] || max_generations="$CLAUDEX_SWEEP_MAX_GENERATIONS"
   if [ "$generation" -ge "$max_generations" ]; then
-    claudex_sweep_set_fields_atomic "$state_file" \
+    claudex_sweep_set_fields_atomic "$state_file" --expect-phase "$verdict_phase" \
       coverage_complete true \
       decision_signal max-reached \
       clean false \
@@ -380,7 +400,7 @@ PY
       phase summarizing || return 4
     return 3
   fi
-  claudex_sweep_set_fields_atomic "$state_file" \
+  claudex_sweep_set_fields_atomic "$state_file" --expect-phase "$verdict_phase" \
     coverage_complete true \
     decision_signal material-findings \
     clean false \

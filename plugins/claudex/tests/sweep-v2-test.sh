@@ -289,6 +289,13 @@ check "cancel removes active process metadata" test ! -e "$ACTIVE_PGID_FILE"
 unset CLAUDEX_SWEEP_PERSONA_TIMEOUT_SECONDS CLAUDEX_SWEEP_STUB_MODE CLAUDEX_SWEEP_STUB_PERSONA
 
 new_repo; start_sweep
+source "$PLUGIN_ROOT/scripts/state-helpers.sh"; source "$PLUGIN_ROOT/scripts/personas.sh"; source "$PLUGIN_ROOT/scripts/sweep-helpers.sh"
+claudex_sweep_set_fields_atomic "$STATE" phase cancelled decision_signal cancelled clean false
+STALE_VERDICT_RC=0
+claudex_sweep_set_fields_atomic "$STATE" --expect-phase reviewing phase summarizing decision_signal converged clean true || STALE_VERDICT_RC=$?
+check "cancelled phase wins a racing stale verdict CAS" bash -c "[ '$STALE_VERDICT_RC' -eq 3 ] && [ \"\$(sed -n 's/^phase: *//p' '$STATE')\" = cancelled ] && [ \"\$(sed -n 's/^decision_signal: *//p' '$STATE')\" = cancelled ]"
+
+new_repo; start_sweep
 bash "$RUNNER" >/dev/null 2>&1
 GEN_DIR=".claude/claudex/$ID/generations/1"
 chmod a-w "$GEN_DIR"
