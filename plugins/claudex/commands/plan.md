@@ -33,9 +33,11 @@ If $ARGUMENTS is empty (no topic, no flags), do NOT run start-loop.sh. Instead, 
 
 Wait for their reply, then re-invoke `/claudex:plan <their answer>`. Do not proceed past this step until you have a topic.
 
-### 2. Offer the topic-sharpening interview
+### 2. Short-circuit review-v3, otherwise offer the topic-sharpening interview
 
-If $ARGUMENTS does NOT contain `--skip-interview`, use the AskUserQuestion tool to offer the user a quick interview before launching the loop. The interview lets the user front-load constraints and worries that would otherwise come out only when Codex flags them on round 2 or 3, a much cheaper signal capture.
+If `$ARGUMENTS` selects `--engine review-v3`, do **not** interview, draft, or revise. Require the existing non-empty `PLAN.md`, preserve it unchanged, launch exactly one frozen five-persona pass with `--rounds 1`, then follow the review-v3 Stop-hook instructions. Skip directly to step 4.
+
+For every other engine, if $ARGUMENTS does NOT contain `--skip-interview`, use the AskUserQuestion tool to offer the user a quick interview before launching the loop. The interview lets the user front-load constraints and worries that would otherwise come out only when Codex flags them on round 2 or 3, a much cheaper signal capture.
 
 Use this exact AskUserQuestion call:
 

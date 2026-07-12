@@ -215,7 +215,12 @@ if [ "$MODE" = "plan" ] && [ "$ENGINE" = "review-v3" ]; then
       ;;
     summarizing)
       SIGNAL=$(claudex_state_read_field "$ACTIVE_STATE" decision_signal)
-      claudex_state_set_field "$ACTIVE_STATE" phase done
+      if ! claudex_sweep_set_fields_atomic "$ACTIVE_STATE" --expect-phase summarizing phase done; then
+        if [ "$(claudex_state_read_field "$ACTIVE_STATE" phase)" = cancelled ]; then
+          approve "review-v3 cancelled before terminal summary commit"
+        fi
+        block "Review-v3 could not commit terminal state; no result is claimed."
+      fi
       rm -f "$RUNNER" "$STATE_DIR/$REVIEW_ID.lock" "$STATE_DIR/$REVIEW_ID-active-pgid" 2>/dev/null
       if [ "$SIGNAL" = converged ]; then
         block "### Claudex review-v3 complete ✓\n\nAll five personas returned valid clean structured results against one frozen hash. Print this summary, then end your turn."

@@ -6,12 +6,12 @@ new(){ D=$(mktemp -d); cd "$D"; git init -q; printf '# Plan\n' > PLAN.md; export
 stub(){ cat > codex <<'EOF'
 #!/usr/bin/env python3
 import json,os,pathlib,sys
-p=sys.stdin.read(); persona=p.split('Persona ID: ')[1].splitlines()[0]; out=pathlib.Path(p.split('Write ONLY JSON to ')[1].splitlines()[0]); sha=p.split('Snapshot SHA-256: ')[1].splitlines()[0]
+p=sys.stdin.read(); persona=p.split('Persona ID: ')[1].splitlines()[0]; out=pathlib.Path(sys.argv[sys.argv.index('--output-last-message')+1]); sha=p.split('Snapshot SHA-256: ')[1].splitlines()[0]
 f=[]
 if os.environ.get('MODE')=='material' and persona=='security-data': f=[{'severity':'high','scope_anchor':'§1','underlying_risk':'lost authorization boundary','failure_scenario':'an unauthorized write succeeds','repository_evidence':['PLAN.md lacks an authorization step'],'proposed_remedy':'add an explicit authorization gate'}]
 r={'persona_id':persona,'snapshot_sha256':sha,'classification':'material' if f else 'clean','findings':f}
 if os.environ.get('MODE')=='id': r={'persona_id':persona,'snapshot_sha256':sha,'classification':'material','findings':[{'finding_id':'CX-9999','severity':'high','scope_anchor':'§1','underlying_risk':'risk','failure_scenario':'failure','repository_evidence':['evidence'],'proposed_remedy':'remedy'}]}
-out.write_text(json.dumps(r))
+out.write_text(json.dumps(r,indent=2,sort_keys=True)+'\n')
 EOF
 chmod +x codex; export CLAUDEX_CODEX_BIN="$D/codex"; }
 run(){ bash "$ROOT/scripts/start-loop.sh" plan --engine review-v3 --rounds 1 --from-draft test >/dev/null; ID=$(basename .claude/claudex/*.state .state); bash ".claude/claudex/$ID-runner.sh"; }

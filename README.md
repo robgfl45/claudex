@@ -237,7 +237,7 @@ The Stop hook is fail-open everywhere. Any error returns `{"decision":"approve"}
 
 ### Experimental review-v3 (opt in)
 
-`--engine review-v3 --rounds 1` runs one broad, frozen and read-only review by all five personas. Each persona is bound to the same immutable `PLAN.md` hash and emits strict structured JSON separating `underlying_risk` from `proposed_remedy`; reviewers may not edit plans, repository files, state, manifests, or one another's artifacts. The runner validates the complete set, assigns deterministic global IDs (`CX-0001`, ...), writes `findings-registry.json`, and renders `consolidated-findings.md` solely from that registry. All clean returns `converged`/0; complete material coverage returns `findings_returned`/10; invalid or mutated evidence degrades. There is no adjudication or revision loop. Roll back immediately by selecting `--engine sweep-v2`. The Hermes default remains sweep-v2 until a later rollout PR and live proof.
+`--engine review-v3 --rounds 1` runs one broad, frozen review by all five personas. Codex is enforced with `--sandbox read-only --ephemeral --ignore-rules`; the runner captures each schema-constrained final JSON response itself and guards the Git worktree plus protected evidence before and after every persona. Each persona is bound to the same immutable `PLAN.md` hash and emits strict structured JSON separating `underlying_risk` from `proposed_remedy`. The runner validates the complete set, assigns deterministic global IDs (`CX-0001`, ...), writes `findings-registry.json`, and renders `consolidated-findings.md` solely from the validated raws. This is a single frozen pass: no interview, drafting, adjudication, revision, or closure loop. All clean returns `converged`/0; complete material coverage returns `findings_returned`/10; invalid or mutated evidence degrades. Roll back immediately by selecting `--engine sweep-v2`. The Hermes default remains sweep-v2 until a later rollout PR and live proof.
 
 This fork adds [`bin/claudex-plan-review`](docs/HEADLESS_ADAPTER.md), a production-oriented adapter for running an existing `PLAN.md` through headless Claude Code and Claudex. Its default `sweep-v2` path runs the Phase 1 frozen-snapshot, five-persona lifecycle with a generation cap of `1..5` (the staged Hermes workflow uses five); `--engine legacy` preserves backward compatibility. It discovers and validates the runtime plugin, validates explicit executable/auth prerequisites, pins child `PATH`, enforces wall-clock and Claude telemetry-budget bounds, kills the complete process group on timeout, copies complete state/generation evidence, and emits one strict JSON result. Run `--preflight-only` before a long delegated review; with the checkout adapter normally omit `--plugin-root`, and pin it only for a deliberately reviewed different plugin.
 
@@ -279,6 +279,12 @@ bash plugins/claudex/tests/smoke-test.sh
 # Synthetic E2E: real Codex calls against a throwaway repo (count printed by test; uses subscription tokens)
 bash plugins/claudex/tests/synthetic-e2e.sh
 
+# Deterministic sweep-v2 lifecycle/adversarial tests
+bash plugins/claudex/tests/sweep-v2-test.sh
+
+# Deterministic review-v3 read-only/evidence/lifecycle tests
+bash plugins/claudex/tests/review-v3-test.sh
+
 # Headless adapter deterministic unit/error/timeout/state-isolation tests
 python3 -m unittest -v tests/test_adapter.py
 ```
@@ -315,6 +321,8 @@ claudex/
 │   ├── tests/
 │   │   ├── platform-validation.sh
 │   │   ├── smoke-test.sh
+│   │   ├── sweep-v2-test.sh
+│   │   ├── review-v3-test.sh
 │   │   └── synthetic-e2e.sh
 │   └── docs/
 └── docs/images/                      # README hero diagrams

@@ -17,7 +17,7 @@ fi
 REVIEW_ID=$(basename "$ACTIVE" .state)
 echo "Cancelling loop: $REVIEW_ID"
 ENGINE=$(claudex_state_read_field "$ACTIVE" engine)
-if [ "$ENGINE" = "sweep-v2" ]; then
+if [ "$ENGINE" = "sweep-v2" ] || [ "$ENGINE" = "review-v3" ]; then
   # Share the same advisory write lock as verdict persistence so cancellation
   # cannot be overwritten by a racing whole-state replacement.
   # shellcheck source=/dev/null
@@ -36,7 +36,7 @@ fi
 # active group before removing artifacts so cancellation cannot leave an
 # orphan reviewer writing into a cancelled generation.
 ACTIVE_PGID_FILE="$CLAUDEX_STATE_DIR/$REVIEW_ID-active-pgid"
-if [ "$ENGINE" = "sweep-v2" ] && [ -f "$ACTIVE_PGID_FILE" ]; then
+if { [ "$ENGINE" = "sweep-v2" ] || [ "$ENGINE" = "review-v3" ]; } && [ -f "$ACTIVE_PGID_FILE" ]; then
   ACTIVE_PGID=$(cat "$ACTIVE_PGID_FILE" 2>/dev/null)
   case "$ACTIVE_PGID" in
     ''|*[!0-9]*) ;;
