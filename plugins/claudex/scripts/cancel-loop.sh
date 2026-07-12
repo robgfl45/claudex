@@ -17,7 +17,11 @@ fi
 REVIEW_ID=$(basename "$ACTIVE" .state)
 echo "Cancelling loop: $REVIEW_ID"
 ENGINE=$(claudex_state_read_field "$ACTIVE" engine)
-if [ "$ENGINE" = "sweep-v2" ]; then
+if [ "$ENGINE" = "review-v3" ]; then
+  python3 "$CLAUDE_PLUGIN_ROOT/scripts/review-v3-cancel.py" "$ACTIVE" "$CLAUDEX_STATE_DIR/$REVIEW_ID-active-pgid" || {
+    echo "Could not persist serialized review-v3 cancellation." >&2; exit 1;
+  }
+elif [ "$ENGINE" = "sweep-v2" ]; then
   # Share the same advisory write lock as verdict persistence so cancellation
   # cannot be overwritten by a racing whole-state replacement.
   # shellcheck source=/dev/null
@@ -56,7 +60,7 @@ fi
 rm -f "$CLAUDEX_STATE_DIR/$REVIEW_ID-runner.sh" 2>/dev/null
 rm -f "$CLAUDEX_STATE_DIR/$REVIEW_ID-prompt.txt" 2>/dev/null
 rm -f "$CLAUDEX_STATE_DIR/$REVIEW_ID.lock" 2>/dev/null
-rm -f "$ACTIVE_PGID_FILE" 2>/dev/null
+if [ "$ENGINE" != "review-v3" ]; then rm -f "$ACTIVE_PGID_FILE" 2>/dev/null; fi
 
 echo "Loop cancelled. Stop hook will allow exit on next fire."
 exit 0

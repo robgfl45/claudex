@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -26,7 +27,7 @@ from typing import Any
 
 TERMINAL_PHASES = {"done", "cancelled", "errored"}
 ACTIVE_PHASES = {"drafting", "reviewing", "revising", "summarizing"}
-EXIT_CODES = {"converged": 0, "max_reached": 10, "degraded": 11, "failed": 12, "timed_out": 124}
+EXIT_CODES = {"converged": 0, "findings_returned": 10, "max_reached": 10, "degraded": 11, "failed": 12, "timed_out": 124}
 SWEEP_PERSONAS = [
     "architecture-scope",
     "security-data",
@@ -287,8 +288,10 @@ def validate_plugin_candidate(path: Path, engine: str) -> tuple[Path | None, lis
         resolved / "hooks" / "stop-hook.sh",
         resolved / "scripts" / "state-helpers.sh",
     ]
-    if engine == "sweep-v2":
+    if engine in {"sweep-v2", "review-v3"}:
         required += [resolved / "scripts" / "sweep-helpers.sh", resolved / "scripts" / "personas.sh"]
+    if engine == "review-v3":
+        required += [resolved / "scripts" / "review-v3.py", resolved / "scripts" / "review-v3-setup.py", resolved / "scripts" / "review-v3-cancel.py", resolved / "scripts" / "review_v3_contract.py"]
     for item in required:
         if not item.is_file():
             errors.append(f"missing required file {item.relative_to(resolved)}")
@@ -738,6 +741,93 @@ def validate_sweep(state_file: Path, review_dir: Path, source_review_dir: Path, 
     }
 
 
+def validate_review_v3(state_file: Path, review_dir: Path, source_review_dir: Path, runtime_plan: Path, reviewed_plan: Path, topic: str) -> dict[str, Any]:
+    """Reconstruct every derived byte from the copied raw persona evidence."""
+    state, errors = strict_state(state_file)
+    generation_dir = review_dir / "generations" / "1"
+    source_generation = source_review_dir / "generations" / "1"
+    snapshot = state.get("snapshot_sha256", "")
+    registry_path = generation_dir / "findings-registry.json"
+    consolidated_path = generation_dir / "consolidated-findings.md"
+    coverage: list[dict[str, Any]] = []
+    counts = {"high": 0, "medium": 0, "low": 0}
+    registry_obj: dict[str, Any] = {}
+    contract_path = Path(__file__).resolve().parents[1] / "plugins" / "claudex" / "scripts" / "review_v3_contract.py"
+    spec = importlib.util.spec_from_file_location("claudex_review_v3_contract", contract_path)
+    if spec is None or spec.loader is None:
+        errors.append("review-v3 contract helper could not be imported")
+        contract = None
+    else:
+        contract = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(contract)
+        except Exception as exc:
+            errors.append(f"review-v3 contract helper import failed: {exc}")
+            contract = None
+    expected_state_keys = {"mode","phase","topic","round","max_rounds","from_draft","interview_used","review_id","repo_root","session_id","started_at","started_at_epoch","last_updated_at","decision_signal","engine","generation","max_generations","snapshot_sha256","coverage_complete","clean","revision_required","registry_sha256","consolidated_sha256","reviewed_live_sha256"}
+    if set(state) != expected_state_keys:
+        errors.append("review-v3 state fields do not exactly match schema")
+    expected_identity = {"mode":"plan","phase":"done","topic":topic,"review_id":state_file.stem,"repo_root":str(runtime_plan.parent),"engine":"review-v3","generation":"1","max_generations":"1","max_rounds":"1","round":"1","coverage_complete":"true","revision_required":"false"}
+    if any(state.get(key) != value for key, value in expected_identity.items()) or not SHA256_RE.fullmatch(snapshot):
+        errors.append("review-v3 state identity/value mismatch")
+    raws: list[dict[str, Any]] = []
+    if contract is not None:
+        try:
+            manifest_path = generation_dir / "manifest.json"
+            manifest_obj = contract.load_bounded_json(manifest_path)
+            contract.validate_manifest(manifest_obj, state_file.stem, snapshot, topic, str(runtime_plan.parent), str(runtime_plan))
+            if manifest_path.read_bytes() != contract.canonical(manifest_obj).encode("utf-8"):
+                raise ValueError("manifest JSON is not canonical")
+            if sha256_file(generation_dir / "PLAN.md") != snapshot or sha256_file(reviewed_plan) != snapshot:
+                raise ValueError("frozen/copied reviewed plan hash mismatch")
+        except Exception as exc:
+            errors.append(f"review-v3 manifest/snapshot invalid: {exc}")
+        for persona in SWEEP_PERSONAS:
+            valid = False
+            classification = "malformed"
+            try:
+                raw_path = generation_dir / f"{persona}.raw.json"
+                sidecar_path = generation_dir / f"{persona}.result.json"
+                raw_obj = contract.load_raw(raw_path, persona, snapshot)
+                sidecar_obj = contract.load_bounded_json(sidecar_path)
+                contract.validate_sidecar(sidecar_obj, persona, snapshot, sha256_file(raw_path))
+                if sidecar_path.read_bytes() != contract.canonical(sidecar_obj).encode("utf-8"):
+                    raise ValueError("sidecar JSON is not canonical")
+                # raw_path is intentionally derived, never trusted from evidence.
+                expected_source_raw = source_generation / f"{persona}.raw.json"
+                if not expected_source_raw.is_absolute():
+                    raise ValueError("canonical source raw path is not absolute")
+                raws.append(raw_obj)
+                classification = raw_obj["classification"]
+                valid = True
+            except Exception as exc:
+                errors.append(f"{persona} structured evidence invalid: {exc}")
+            coverage.append({"persona_id": persona, "snapshot_sha256": snapshot if valid else None, "valid": valid, "classification": classification})
+        try:
+            expected_registry = contract.registry(state_file.stem, snapshot, topic, str(runtime_plan.parent), str(runtime_plan), raws)
+            registry_obj = contract.load_bounded_json(registry_path)
+            contract.validate_registry(registry_obj, expected_registry)
+            expected_registry_bytes = contract.canonical(expected_registry).encode("utf-8")
+            if registry_path.read_bytes() != expected_registry_bytes:
+                raise ValueError("registry bytes are not canonical/exact")
+            expected_consolidated = contract.render(expected_registry).encode("utf-8")
+            if consolidated_path.read_bytes() != expected_consolidated:
+                raise ValueError("consolidated bytes do not match reconstructed registry")
+            if state.get("registry_sha256") != hashlib.sha256(expected_registry_bytes).hexdigest() or state.get("consolidated_sha256") != hashlib.sha256(expected_consolidated).hexdigest():
+                raise ValueError("state derived-evidence digests mismatch")
+            if state.get("reviewed_live_sha256") != snapshot:
+                raise ValueError("state reviewed plan digest mismatch")
+            for finding in expected_registry["findings"]:
+                counts[finding["severity"]] += 1
+        except Exception as exc:
+            errors.append(f"review-v3 derived evidence invalid: {exc}")
+    material = bool(registry_obj.get("findings", [])) if not errors else False
+    expected_signal = "findings-returned" if material else "converged"
+    terminal = state.get("decision_signal") == expected_signal and state.get("clean") == str(not material).lower()
+    outcome = ("findings_returned" if material else "converged") if not errors and terminal and len(raws) == 5 and all(item["valid"] for item in coverage) else "degraded"
+    return {"outcome":outcome,"reason":"validated copied review-v3 raw evidence and exactly reconstructed derived bytes" if outcome!="degraded" else "review-v3 evidence incomplete or inconsistent: "+"; ".join(errors[:4]),"state":state,"generation":1,"max_generations":1,"snapshot_sha256":snapshot or None,"converged_snapshot_sha256":snapshot if outcome=="converged" else None,"persona_coverage":coverage,"severity_counts":counts,"findings_status":"material" if outcome=="findings_returned" else ("none" if outcome=="converged" else "malformed"),"generation_dir":generation_dir,"manifest":generation_dir/"manifest.json","consolidated":consolidated_path,"registry":registry_path,"errors":errors}
+
+
 def parse_claude_stream(path: Path) -> dict[str, Any]:
     summary: dict[str, Any] = {"result_records": 0, "reported_cost_usd": None, "session_id": None}
     try:
@@ -784,7 +874,7 @@ def main() -> int:
     parser.add_argument("--plan", required=True, help="absolute path to an existing non-empty PLAN.md")
     parser.add_argument("--topic", required=True, help="self-contained review topic and constraints")
     parser.add_argument("--rounds", required=True, type=int, help="positive Claudex round limit")
-    parser.add_argument("--engine", choices=("sweep-v2", "legacy"), default="sweep-v2", help="plan-review engine (default: sweep-v2)")
+    parser.add_argument("--engine", choices=("review-v3", "sweep-v2", "legacy"), default="sweep-v2", help="plan-review engine (default: sweep-v2)")
     parser.add_argument("--resume-review-id", help="resume one interrupted sweep-v2 review ID")
     parser.add_argument("--timeout", required=True, type=float, help="wall-clock timeout in seconds")
     parser.add_argument("--budget-usd", required=True, help="positive Claude Code budget cap")
@@ -808,6 +898,8 @@ def main() -> int:
             raise ValueError("--rounds must be a positive integer")
         if args.engine == "sweep-v2" and args.rounds > 5:
             raise ValueError("sweep-v2 --rounds must be in 1..5 generations")
+        if args.engine == "review-v3" and args.rounds != 1:
+            raise ValueError("review-v3 requires --rounds 1")
         if args.resume_review_id and args.engine != "sweep-v2":
             raise ValueError("--resume-review-id is supported only with --engine sweep-v2")
         if args.timeout <= 0:
@@ -938,7 +1030,7 @@ def main() -> int:
         _PENDING_PLAN_RESTORE = (runtime_plan, original_runtime_plan, original_runtime_plan.exists())
         shutil.copy2(plan, runtime_plan)
 
-    engine_flag = "--engine sweep-v2 " if args.engine == "sweep-v2" else ""
+    engine_flag = f"--engine {args.engine} " if args.engine != "legacy" else ""
     resume_flag = f"--resume-review-id {args.resume_review_id} " if args.resume_review_id else "--from-draft "
     prompt = f"/claudex:plan {engine_flag}{resume_flag}--skip-interview --rounds {args.rounds} {args.topic.strip()}"
     command = [
@@ -1059,11 +1151,14 @@ def main() -> int:
     decision = state.get("decision_signal")
     sweep: dict[str, Any] | None = None
     if timed_out or externally_interrupted:
-        if args.engine == "sweep-v2" and state_identity_valid and evidence_state and evidence_review_dir and not copy_errors:
-            sweep = validate_sweep(
-                evidence_state, evidence_review_dir, findings_dir, runtime_plan,
-                evidence / "PLAN.after.md", args.rounds, args.topic.strip(),
-            )
+        if args.engine in {"sweep-v2", "review-v3"} and state_identity_valid and evidence_state and evidence_review_dir and not copy_errors:
+            if args.engine == "review-v3":
+                sweep = validate_review_v3(evidence_state, evidence_review_dir, findings_dir, runtime_plan, evidence / "PLAN.after.md", args.topic.strip())
+            else:
+                sweep = validate_sweep(
+                    evidence_state, evidence_review_dir, findings_dir, runtime_plan,
+                    evidence / "PLAN.after.md", args.rounds, args.topic.strip(),
+                )
             state = sweep["state"]
             phase = state.get("phase")
             decision = state.get("decision_signal")
@@ -1087,6 +1182,15 @@ def main() -> int:
     elif copy_errors:
         outcome = "degraded"
         reason = "required adapter evidence could not be copied: " + "; ".join(copy_errors)
+    elif args.engine == "review-v3":
+        sweep = validate_review_v3(evidence_state, evidence_review_dir, findings_dir, runtime_plan, evidence / "PLAN.after.md", args.topic.strip())
+        state = sweep["state"]
+        phase = state.get("phase")
+        decision = state.get("decision_signal")
+        outcome = sweep["outcome"]
+        reason = sweep["reason"]
+        findings_status = sweep["findings_status"]
+        severity = sweep["severity_counts"]
     elif args.engine == "sweep-v2":
         sweep = validate_sweep(
             evidence_state,
@@ -1149,6 +1253,7 @@ def main() -> int:
         "generation_manifest": str(copied_manifest) if copied_manifest else None,
         "generation_evidence_dir": str(copied_generation_dir) if copied_generation_dir else None,
         "consolidated_findings": str(copied_consolidated) if copied_consolidated else None,
+        "findings_registry": str(copied_generation_dir / "findings-registry.json") if copied_generation_dir and (copied_generation_dir / "findings-registry.json").is_file() else None,
         "round": int(state["round"]) if args.engine == "legacy" and state.get("round", "").isdigit() else None,
         "max_rounds": int(state["max_rounds"]) if args.engine == "legacy" and state.get("max_rounds", "").isdigit() else (args.rounds if args.engine == "legacy" else None),
         "findings_status": findings_status,

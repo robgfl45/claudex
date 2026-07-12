@@ -14,6 +14,10 @@
 
 Interactive review mode and the plugin's legacy plan mode are unchanged.
 
+## Experimental review-v3
+
+Select `--engine review-v3 --rounds 1` for a single frozen, read-only five-persona review. It produces strict per-persona JSON, runner-owned stable `CX-NNNN` identities, `findings-registry.json`, and registry-derived `consolidated-findings.md`. It never edits `PLAN.md`, requests a revision, adjudicates findings, or accepts a proposed remedy merely because its underlying risk is accepted. Complete clean coverage is `converged` (0); complete material coverage is the distinct non-clean `findings_returned` (10). A per-persona timeout, reviewer nonzero, malformed/missing/oversized output, identity mismatch, or mutation makes review-v3 degraded/non-clean; the adapter's independent wall-clock expiration remains `timed_out` with exit 124. The frozen plan is protected by a canonical manifest plus repeated SHA-256 and byte validation—not by filesystem immutability—and repository byte/mode/symlink snapshots provide defense in depth. `--preflight-only` validates the review-v3 runner without creating state/evidence. Use `--engine sweep-v2` for rollback. Review-v3 is experimental and opt-in; `sweep-v2` remains the Hermes default, and rollout awaits the next PR and live proof.
+
 ## Exact usage
 
 ```bash
@@ -44,6 +48,7 @@ Stdout contains exactly one compact JSON object. Diagnostics go to evidence file
 |---|---:|---:|---|
 | `converged` | 0 | yes | State is done/converged/clean/coverage-complete and exactly five required personas have valid clean evidence against the same snapshot; manifest, hashes, and consolidated findings all agree. |
 | `max_reached` | 10 | no | The generation cap ended with complete authoritative same-snapshot evidence containing material findings. |
+| `findings_returned` | 10 | no | Review-v3 completed all five personas against one hash and returned validated material findings; no adjudication or closure is implied. |
 | `degraded` | 11 | no | State/evidence is incomplete, contradictory, missing, malformed, mutated, hash-mismatched, cancelled, or otherwise non-authoritative. |
 | `failed` | 12 | no | Validation, prerequisite/auth, launch, or Claude execution failed. |
 | `timed_out` | 124 | no | The deadline expired; the complete process group was killed and reaped. |

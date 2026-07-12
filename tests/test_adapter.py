@@ -73,6 +73,38 @@ if outcome.startswith('legacy_'):
         signal, findings, round_value = 'no-material-findings', '# Round 1 findings\n\nNo substantive findings.\n', '1'
     (review_dir / 'findings-round-1.md').write_text(findings)
     state_path.write_text(f'''mode: plan\nphase: done\ntopic: test\nround: {round_value}\nmax_rounds: 1\nreview_id: {rid}\nrepo_root: {pathlib.Path.cwd().resolve()}\ndecision_signal: {signal}\n''')
+elif outcome.startswith('review_v3_'):
+    personas = ['architecture-scope','security-data','product-domain','quality-accessibility-performance','operations-deployment']
+    generation_dir = review_dir / 'generations' / '1'; generation_dir.mkdir(parents=True)
+    snapshot = generation_dir / 'PLAN.md'; snapshot.write_bytes((pathlib.Path.cwd() / 'PLAN.md').read_bytes()); snapshot_hash = hashlib.sha256(snapshot.read_bytes()).hexdigest()
+    topic = 'review the grounded plan'; repo = str(pathlib.Path.cwd().resolve()); source = repo + '/PLAN.md'
+    canonical = lambda obj: json.dumps(obj, indent=2, sort_keys=True) + '\n'
+    manifest = {'schema_version':1,'review_id':rid,'engine':'review-v3','generation':1,'snapshot_sha256':snapshot_hash,'required_persona_ids':personas,'topic':topic,'repo_root':repo,'source_plan_path':source}
+    (generation_dir/'manifest.json').write_text(canonical(manifest)); raws=[]; findings=[]
+    for persona in personas:
+        fs=[]
+        if outcome == 'review_v3_material' and persona == 'security-data': fs=[{'severity':'high','scope_anchor':'section 1','underlying_risk':'authorization absent','failure_scenario':'unauthorized write succeeds','repository_evidence':['PLAN.md omits authorization'],'proposed_remedy':'add authorization gate'}]
+        raw_obj={'persona_id':persona,'snapshot_sha256':snapshot_hash,'classification':'material' if fs else 'clean','findings':fs}; raws.append(raw_obj)
+        raw=generation_dir/f'{persona}.raw.json'; raw.write_text(canonical(raw_obj))
+        side={'schema_version':1,'generation':1,'persona_id':persona,'snapshot_sha256':snapshot_hash,'raw_sha256':hashlib.sha256(raw.read_bytes()).hexdigest(),'codex_exit_code':0,'valid':True,'error':None,'completed_at':'2099-01-01T00:00:00Z'}
+        (generation_dir/f'{persona}.result.json').write_text(canonical(side))
+        for finding in fs: findings.append({'finding_id':f'CX-{len(findings)+1:04d}','persona_id':persona,**finding})
+    registry={'schema_version':1,'generation':1,'review_id':rid,'engine':'review-v3','snapshot_sha256':snapshot_hash,'topic':topic,'repo_root':repo,'source_plan_path':source,'persona_order':personas,'findings':findings}
+    registry_path=generation_dir/'findings-registry.json'; registry_path.write_text(canonical(registry))
+    out=['# Consolidated review-v3 findings\n',f'Review ID: `{rid}`  ',f'Snapshot SHA-256: `{snapshot_hash}`\n']
+    if not findings: out.append('No substantive findings.\n')
+    for f in findings: out += [f"## {f['finding_id']} — {f['severity']}\n",f"**Persona:** `{f['persona_id']}`\n",f"**Scope anchor:** {f['scope_anchor']}\n",f"**Underlying risk:** {f['underlying_risk']}\n",f"**Failure scenario:** {f['failure_scenario']}\n",'**Repository evidence:**',*[f"- {x}" for x in f['repository_evidence']],'',f"**Proposed remedy (not accepted by implication):** {f['proposed_remedy']}\n"]
+    consolidated=generation_dir/'consolidated-findings.md'; consolidated.write_text('\n'.join(out).rstrip()+'\n')
+    material=bool(findings); now='2099-01-01T00:00:00Z'
+    state_path.write_text(f'''mode: plan\nphase: done\ntopic: "{topic}"\nround: 1\nmax_rounds: 1\nfrom_draft: true\ninterview_used: false\nreview_id: {rid}\nrepo_root: {repo}\nsession_id: fake\nstarted_at: {now}\nstarted_at_epoch: 4070908800\nlast_updated_at: {now}\ndecision_signal: {'findings-returned' if material else 'converged'}\nengine: review-v3\ngeneration: 1\nmax_generations: 1\nsnapshot_sha256: {snapshot_hash}\ncoverage_complete: true\nclean: {str(not material).lower()}\nrevision_required: false\nregistry_sha256: {hashlib.sha256(registry_path.read_bytes()).hexdigest()}\nconsolidated_sha256: {hashlib.sha256(consolidated.read_bytes()).hexdigest()}\nreviewed_live_sha256: {snapshot_hash}\n''')
+    if outcome == 'review_v3_tamper_raw': (generation_dir/f'{personas[0]}.raw.json').write_text('{}\n')
+    elif outcome == 'review_v3_tamper_sidecar': (generation_dir/f'{personas[0]}.result.json').write_text('{}\n')
+    elif outcome == 'review_v3_tamper_manifest': (generation_dir/'manifest.json').write_text('{}\n')
+    elif outcome == 'review_v3_tamper_registry': registry_path.write_text('{}\n')
+    elif outcome == 'review_v3_tamper_consolidated': consolidated.write_text('tampered\n')
+    elif outcome == 'review_v3_tamper_state_digest': state_path.write_text(state_path.read_text().replace('registry_sha256: ', 'registry_sha256: 0'))
+    elif outcome == 'review_v3_tamper_state_identity': state_path.write_text(state_path.read_text().replace(f'review_id: {rid}', 'review_id: 20990101-000000-deadbe'))
+    elif outcome == 'review_v3_tamper_state_verdict': state_path.write_text(state_path.read_text().replace('clean: true', 'clean: false'))
 else:
     personas = ['architecture-scope','security-data','product-domain','quality-accessibility-performance','operations-deployment']
     match = re.search(r'--rounds (\d+)', prompt)
@@ -719,6 +751,50 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         self.assertEqual((first.returncode, second.returncode), (0, 0))
         self.assertNotEqual(result1["review_id"], result2["review_id"])
         self.assertNotEqual(result1["state_file"], result2["state_file"])
+
+    def test_review_v3_preflight_and_exact_one_round_gate(self):
+        completed, result = self.run_adapter(preflight=True, engine="review-v3", rounds="1")
+        self.assertEqual((completed.returncode, result["outcome"]), (0, "preflight_ok"))
+        self.assertEqual(result["preflight"]["engine"], "review-v3")
+        self.assertFalse((self.repo / ".claude" / "claudex").exists())
+        marker = self.base / "review-v3-provider"
+        completed, result = self.run_adapter(preflight=True, engine="review-v3", rounds="2", extra_env={"FAKE_PROMPT_FILE": str(marker)})
+        self.assertEqual(completed.returncode, 12)
+        self.assertIn("requires --rounds 1", result["error"]["message"])
+        self.assertFalse(marker.exists())
+
+    def test_review_v3_adapter_clean_material_and_external_plan_readback(self):
+        for fixture, code, expected in (("review_v3_clean", 0, "converged"), ("review_v3_material", 10, "findings_returned")):
+            with self.subTest(fixture=fixture):
+                completed, result = self.run_adapter(fixture, engine="review-v3")
+                self.assertEqual((completed.returncode, result["outcome"]), (code, expected))
+                self.assertEqual([item["persona_id"] for item in result["persona_coverage"]], PERSONAS)
+                for key in ("evidence_state_file","generation_manifest","generation_evidence_dir","consolidated_findings","findings_registry"):
+                    self.assertTrue(Path(result[key]).exists(), key)
+                generation = Path(result["generation_evidence_dir"])
+                for persona in PERSONAS:
+                    self.assertTrue((generation / f"{persona}.raw.json").is_file())
+                    self.assertTrue((generation / f"{persona}.result.json").is_file())
+        original = self.plan.read_text()
+        external = self.base / "review-v3-external.md"; external.write_text("# External review-v3 plan\n")
+        completed, result = self.run_adapter("review_v3_clean", engine="review-v3", plan=external)
+        self.assertEqual((completed.returncode, result["outcome"]), (0, "converged"))
+        self.assertEqual(self.plan.read_text(), original)
+        self.assertEqual(external.read_text(), "# External review-v3 plan\n")
+
+    def test_review_v3_copied_evidence_tamper_degrades(self):
+        fixtures = (
+            "review_v3_tamper_raw", "review_v3_tamper_sidecar", "review_v3_tamper_manifest",
+            "review_v3_tamper_registry", "review_v3_tamper_consolidated",
+            "review_v3_tamper_state_digest", "review_v3_tamper_state_identity",
+            "review_v3_tamper_state_verdict",
+        )
+        for fixture in fixtures:
+            with self.subTest(fixture=fixture):
+                completed, result = self.run_adapter(fixture, engine="review-v3")
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertFalse(result.get("clean", False))
+                self.assertIn(result["outcome"], ("degraded", "failed"))
 
     def test_sweep_generation_cap_is_rejected_before_launch(self):
         completed, result = self.run_adapter(rounds="6")

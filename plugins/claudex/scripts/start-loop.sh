@@ -118,8 +118,8 @@ case "$MODE" in
       echo "Plan mode requires a topic. Usage: start-loop.sh plan <topic>" >&2
       exit 2
     fi
-    if [ "$ENGINE" != "legacy" ] && [ "$ENGINE" != "sweep-v2" ]; then
-      echo "Unknown plan engine: $ENGINE. Use sweep-v2 or omit --engine for legacy mode." >&2
+    if [ "$ENGINE" != "legacy" ] && [ "$ENGINE" != "sweep-v2" ] && [ "$ENGINE" != "review-v3" ]; then
+      echo "Unknown plan engine: $ENGINE. Use review-v3, sweep-v2, or omit --engine for legacy mode." >&2
       exit 2
     fi
     if [ "$ENGINE" = "sweep-v2" ]; then
@@ -139,6 +139,14 @@ case "$MODE" in
         echo "sweep-v2 has a hard maximum of five generations." >&2
         exit 2
       fi
+    fi
+    if [ "$ENGINE" = "review-v3" ]; then
+      [ "$CUSTOM_ROUNDS" = "1" ] || { echo "review-v3 requires --rounds 1." >&2; exit 2; }
+      [ -s PLAN.md ] || { echo "review-v3 requires an existing non-empty PLAN.md." >&2; exit 2; }
+      command -v python3 >/dev/null 2>&1 || { echo "review-v3 requires python3." >&2; exit 2; }
+      for helper in review-v3.py review-v3-setup.py review_v3_contract.py; do
+        [ -s "$CLAUDE_PLUGIN_ROOT/scripts/$helper" ] || { echo "review-v3 required helper is missing: $helper" >&2; exit 2; }
+      done
     fi
     ;;
   review)
@@ -326,8 +334,8 @@ MAX_PLAN_ROUNDS="${CLAUDEX_MAX_PLAN_ROUNDS:-3}"
 MAX_REVIEW_ROUNDS="${CLAUDEX_MAX_REVIEW_ROUNDS:-3}"
 
 if [ "$MODE" = "plan" ]; then
-  if [ "$ENGINE" = "sweep-v2" ]; then
-    MAX_ROUNDS=5
+  if [ "$ENGINE" = "sweep-v2" ] || [ "$ENGINE" = "review-v3" ]; then
+    MAX_ROUNDS=$([ "$ENGINE" = "review-v3" ] && echo 1 || echo 5)
     PHASE="reviewing"
   else
     MAX_ROUNDS="$MAX_PLAN_ROUNDS"
@@ -379,9 +387,30 @@ coverage_complete: false
 clean: false
 revision_required: false"
 fi
+if [ "$ENGINE" = "review-v3" ]; then
+  STATE_CONTENT="$STATE_CONTENT
+engine: review-v3
+generation: 1
+max_generations: 1
+snapshot_sha256:
+coverage_complete: false
+clean: false
+revision_required: false"
+fi
 
 claudex_state_write "$STATE_FILE" "$STATE_CONTENT" || exit 3
-claudex_lock_write "$LOCK_FILE" || exit 3
+if ! claudex_lock_write "$LOCK_FILE"; then
+  # The state is already visible to the repository-wide active-loop scan. Make
+  # it terminal atomically before releasing this new review's partial ownership;
+  # if even that persistence fails, remove the partial state rather than leave
+  # an active-looking `reviewing` record behind.
+  if ! claudex_state_set_field "$STATE_FILE" phase errored; then
+    rm -f "$STATE_FILE"
+  fi
+  rm -f "$LOCK_FILE" "$CLAUDEX_STATE_DIR/$REVIEW_ID-runner.sh"
+  echo "Failed to acquire claudex loop lock; partial ownership released." >&2
+  exit 3
+fi
 
 if [ "$ENGINE" = "sweep-v2" ]; then
   # shellcheck source=/dev/null
@@ -399,6 +428,22 @@ if [ "$ENGINE" = "sweep-v2" ]; then
     exit 3
   }
 fi
+if [ "$ENGINE" = "review-v3" ]; then
+  if ! SNAPSHOT_SHA=$(python3 "$CLAUDE_PLUGIN_ROOT/scripts/review-v3-setup.py" \
+      --state-dir "$CLAUDEX_STATE_DIR" --plugin-root "$CLAUDE_PLUGIN_ROOT" \
+      --review-id "$REVIEW_ID" --topic "$TOPIC" --repo "$REPO_ROOT"); then
+    claudex_state_set_field "$STATE_FILE" phase errored
+    rm -f "$LOCK_FILE" "$CLAUDEX_STATE_DIR/$REVIEW_ID-runner.sh"
+    echo "Failed to create canonical review-v3 evidence/config; ownership released." >&2
+    exit 3
+  fi
+  if ! claudex_state_set_field "$STATE_FILE" snapshot_sha256 "$SNAPSHOT_SHA"; then
+    claudex_state_set_field "$STATE_FILE" phase errored
+    rm -f "$LOCK_FILE" "$CLAUDEX_STATE_DIR/$REVIEW_ID-runner.sh"
+    echo "Failed to bind review-v3 snapshot to state; ownership released." >&2
+    exit 3
+  fi
+fi
 
 # Print initial instructions to stdout. Claude will read these.
 case "$MODE" in
@@ -411,6 +456,15 @@ case "$MODE" in
       echo "Snapshot SHA-256: $SNAPSHOT_SHA"
       echo "Frozen snapshot: $CLAUDEX_STATE_DIR/$REVIEW_ID/generations/1/PLAN.md"
       echo "End your turn. The Stop hook will provide the deterministic sequential runner command."
+      exit 0
+    fi
+    if [ "$ENGINE" = "review-v3" ]; then
+      echo "Claudex review-v3 initialized."
+      echo "Review ID: $REVIEW_ID"
+      echo "Topic: $TOPIC"
+      echo "Snapshot SHA-256: $SNAPSHOT_SHA"
+      echo "Frozen snapshot: $CLAUDEX_STATE_DIR/$REVIEW_ID/generations/1/PLAN.md"
+      echo "End your turn. The Stop hook will provide the deterministic runner command."
       exit 0
     fi
     echo "Claudex plan mode initialized."
