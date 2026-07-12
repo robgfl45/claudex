@@ -22,6 +22,22 @@ new; stub; bash "$ROOT/scripts/start-loop.sh" plan --engine review-v3 --rounds 2
 new; stub; EVIL='quotes `touch PWNED1` new
 line $(touch PWNED2) $HOME'; bash "$ROOT/scripts/start-loop.sh" plan --engine review-v3 --rounds 1 --from-draft "$EVIL" >/dev/null; test ! -e PWNED1; test ! -e PWNED2; ID=$(basename .claude/claudex/*.state .state); python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["topic"]==sys.argv[2]' ".claude/claudex/$ID/runner-config.json" "$EVIL"; ! grep -Fq "$EVIL" ".claude/claudex/$ID-runner.sh"; ok 'shell-injection topic remains inert and exact in config'
 new; stub; UTF='réview 🔒'; bash "$ROOT/scripts/start-loop.sh" plan --engine review-v3 --rounds 1 --from-draft "$UTF" >/dev/null; ID=$(basename .claude/claudex/*.state .state); python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); assert m["topic"]==sys.argv[2] and sys.argv[2].encode() in open(sys.argv[1],"rb").read()' ".claude/claudex/$ID/generations/1/manifest.json" "$UTF"; ok 'non-ASCII topic survives canonical manifest bytes'
+FIXTURE=$(mktemp -d); cp -R "$ROOT/." "$FIXTURE/plugin"; python3 - "$FIXTURE/plugin/scripts/state-helpers.sh" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+s = p.read_text()
+s = s.replace("claudex_lock_write() {", "claudex_lock_write_real() {", 1)
+s += '''\nclaudex_lock_write() {\n  claudex_lock_write_real "$1" || return 1\n  [ "${CLAUDEX_TEST_LOCK_WRITE_FAIL:-}" != 1 ]\n}\n'''
+p.write_text(s)
+PY
+D=$(mktemp -d); cd "$D"; git init -q; printf '# Plan\n' > PLAN.md; export CLAUDE_PLUGIN_ROOT="$FIXTURE/plugin" CLAUDEX_STATE_DIR=.claude/claudex CLAUDEX_TEST_LOCK_WRITE_FAIL=1
+set +e; bash "$FIXTURE/plugin/scripts/start-loop.sh" plan --engine review-v3 --rounds 1 --from-draft test >/dev/null 2>&1; LOCK_RC=$?; set -e
+test "$LOCK_RC" -eq 3
+for STATE in .claude/claudex/*.state; do [ ! -e "$STATE" ] || test "$(sed -n 's/^phase: *//p' "$STATE")" = errored; done
+test -z "$(grep -l '^phase: *reviewing$' .claude/claudex/*.state 2>/dev/null || true)"
+unset CLAUDEX_TEST_LOCK_WRITE_FAIL
+bash "$FIXTURE/plugin/scripts/start-loop.sh" plan --engine review-v3 --rounds 1 --from-draft test >/dev/null
+ok 'lock-write failure leaves no active reviewing state and permits a subsequent start'
 RUNNER_OUTPUT=$(python3 "$ROOT/tests/review-v3-integration-test.py")
 printf '%s\n' "$RUNNER_OUTPUT"
 RUNNER_TOTAL=$(python3 -c 'import re,sys; print(int(re.search(r"RUNNER INTEGRATION PASS: ([0-9]+)",sys.argv[1]).group(1)))' "$RUNNER_OUTPUT")

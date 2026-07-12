@@ -399,7 +399,18 @@ revision_required: false"
 fi
 
 claudex_state_write "$STATE_FILE" "$STATE_CONTENT" || exit 3
-claudex_lock_write "$LOCK_FILE" || exit 3
+if ! claudex_lock_write "$LOCK_FILE"; then
+  # The state is already visible to the repository-wide active-loop scan. Make
+  # it terminal atomically before releasing this new review's partial ownership;
+  # if even that persistence fails, remove the partial state rather than leave
+  # an active-looking `reviewing` record behind.
+  if ! claudex_state_set_field "$STATE_FILE" phase errored; then
+    rm -f "$STATE_FILE"
+  fi
+  rm -f "$LOCK_FILE" "$CLAUDEX_STATE_DIR/$REVIEW_ID-runner.sh"
+  echo "Failed to acquire claudex loop lock; partial ownership released." >&2
+  exit 3
+fi
 
 if [ "$ENGINE" = "sweep-v2" ]; then
   # shellcheck source=/dev/null
