@@ -28,6 +28,9 @@ if mode=='timeout':
 if mode=='mutate':
  target=pathlib.Path(os.environ['MUTATE']); kind=os.environ.get('MUTATION_KIND','write')
  if kind=='mode': target.chmod(target.stat().st_mode ^ 0o100)
+ elif kind=='mkdir': target.mkdir()
+ elif kind=='rmdir': target.rmdir()
+ elif kind=='dirmode': target.chmod(target.stat().st_mode ^ 0o100)
  elif kind=='symlink': target.unlink(); target.symlink_to('other-target')
  else: target.write_text(target.read_text()+'changed')
 verdict={'closed':'closed','not_closed':'not_closed','architecture':'closure_requires_new_review','id_mismatch':'closed','empty_evidence':'closed'}.get(mode,'closed'); out={'finding_id':'CX-9999' if mode=='id_mismatch' else fid,'verdict':verdict,'evidence':[] if mode=='empty_evidence' else ['final plan Safety section'],'reason':'exact risk assessment'}
@@ -71,6 +74,16 @@ else: raw.write_text(json.dumps(out,indent=2,sort_keys=True)+'\\n')
   cases.append((self.repo/'.git/config','write'))
   for target,kind in cases:
    with self.subTest(target=target.name,kind=kind): self.assertOutcome('degraded',mode='mutate',extra={'MUTATE':str(target),'MUTATION_KIND':kind})
+ def test_empty_directory_create_delete_and_directory_mode_mutations(self):
+  created=self.repo/'created-empty'
+  deleted=self.repo/'deleted-empty'; deleted.mkdir()
+  mode_dir=self.repo/'mode-dir'; mode_dir.mkdir()
+  for target,kind in ((created,'mkdir'),(deleted,'rmdir'),(mode_dir,'dirmode')):
+   with self.subTest(kind=kind):
+    self.assertOutcome('degraded',mode='mutate',extra={'MUTATE':str(target),'MUTATION_KIND':kind})
+    if kind=='mkdir': target.rmdir()
+    elif kind=='rmdir': target.mkdir()
+    else: target.chmod(target.stat().st_mode ^ 0o100)
  def test_copied_tamper(self): self.assertOutcome('degraded',extra={'CLAUDEX_CLOSURE_TAMPER_HOOK':'1'})
  def test_no_verifier_for_parent_dispositions(self):
   _,r,_=self.assertOutcome('accepted_after_targeted_closure',rows=[self.row(disp='reject-scope-creep',sections=[])]); self.assertEqual(r['verifications'],[])
@@ -114,4 +127,11 @@ else: raw.write_text(json.dumps(out,indent=2,sort_keys=True)+'\\n')
   other=self.repo/'OTHER.md'; other.write_bytes(self.orig.read_bytes()); reg=json.loads(self.reg.read_text()); reg['source_plan_path']=str(other.resolve()); self.reg.write_text(canon(reg)); self.assertOutcome('degraded')
  def test_forged_prior_result_and_unanchored_manifest_rejected(self):
   _,r,o=self.assertOutcome('blocked',mode='not_closed'); q=self.d/'forged'; shutil.copytree(o,q); x=json.loads((q/'result.json').read_text()); x['review_id']='foreign'; (q/'result.json').write_text(canon(x)); tm=json.loads((q/'terminal-manifest.json').read_text()); row=next(z for z in tm['files'] if z['path']=='result.json'); row['bytes']=(q/'result.json').stat().st_size; row['sha256']=hashlib.sha256((q/'result.json').read_bytes()).hexdigest(); tm['result_sha256']=row['sha256']; (q/'terminal-manifest.json').write_text(canon(tm)); self.assertNotEqual(self.verify(q,r['terminal_manifest_sha256'])[0].returncode,0)
+ def test_attempt2_ingestion_rejects_self_consistent_forged_prior_before_verifier(self):
+  _,_,o=self.assertOutcome('blocked',mode='not_closed'); q=self.d/'forged-attempt2'; shutil.copytree(o,q)
+  result=json.loads((q/'result.json').read_text()); result['review_id']='foreign'; (q/'result.json').write_text(canon(result))
+  terminal=json.loads((q/'terminal-manifest.json').read_text()); terminal['review_id']='foreign'; row=next(z for z in terminal['files'] if z['path']=='result.json'); row['bytes']=(q/'result.json').stat().st_size; row['sha256']=hashlib.sha256((q/'result.json').read_bytes()).hexdigest(); terminal['result_sha256']=row['sha256']; (q/'terminal-manifest.json').write_text(canon(terminal))
+  self.log.unlink(missing_ok=True)
+  p,r,_,_=self.run_cli(rows=[self.row()],attempt=2,prior_path=q/'result.json')
+  self.assertEqual(p.returncode,11); self.assertEqual(r['outcome'],'degraded'); self.assertIn('prior result review_id mismatch',r['error']); self.assertFalse(self.log.exists(),'attempt-2 ingestion launched a verifier')
 if __name__=='__main__': unittest.main(verbosity=2)

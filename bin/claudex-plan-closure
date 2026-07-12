@@ -44,17 +44,18 @@ def abs_dir(raw,label):
  if not p.is_dir(): raise ValueError(f"{label} invalid")
  return p
 def repo_state(repo,excluded):
- out={}; excluded=excluded.resolve(strict=False)
+ out={}; excluded=pathlib.Path(os.path.abspath(excluded))
  for base,dirs,files in os.walk(repo,topdown=True,followlinks=False):
-  bp=pathlib.Path(base); dirs[:]=[d for d in dirs if (bp/d).resolve(strict=False)!=excluded and excluded not in (bp/d).resolve(strict=False).parents]
+  bp=pathlib.Path(base); dirs[:]=[d for d in dirs if (bp/d)!=excluded and excluded not in (bp/d).parents]
   for name in sorted(files+dirs):
    p=bp/name
-   if p.resolve(strict=False)==excluded or excluded in p.resolve(strict=False).parents: continue
+   if p==excluded or excluded in p.parents: continue
    try: st=os.lstat(p)
    except FileNotFoundError: continue
    mode=stat.S_IMODE(st.st_mode); rel=str(p.relative_to(repo))
    if stat.S_ISLNK(st.st_mode): out[rel]=("link",mode,os.readlink(p))
    elif stat.S_ISREG(st.st_mode): out[rel]=("file",mode,c.sha(p))
+   elif stat.S_ISDIR(st.st_mode): out[rel]=("dir",mode)
  return out
 def terminal_entries(root):
  rows=[]
