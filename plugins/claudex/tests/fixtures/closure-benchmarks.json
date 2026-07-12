@@ -1,0 +1,6 @@
+[
+  {"name":"clean-plan","old_provider_calls":15,"new_broad_calls":5,"closure_calls":0,"old_elapsed_ms":300,"new_elapsed_ms":95,"old_plan_byte_growth":420,"new_plan_byte_growth":0,"finding_ids":[],"closure_outcome":"accepted_after_targeted_closure","evidence_valid":true},
+  {"name":"migration-concurrency","old_provider_calls":15,"new_broad_calls":5,"closure_calls":2,"old_elapsed_ms":390,"new_elapsed_ms":145,"old_plan_byte_growth":3100,"new_plan_byte_growth":680,"finding_ids":["CX-0001","CX-0002","CX-0003"],"closure_outcome":"accepted_after_targeted_closure","evidence_valid":true},
+  {"name":"privacy-security","old_provider_calls":15,"new_broad_calls":5,"closure_calls":2,"old_elapsed_ms":420,"new_elapsed_ms":155,"old_plan_byte_growth":2800,"new_plan_byte_growth":540,"finding_ids":["CX-0001","CX-0002"],"closure_outcome":"accepted_after_targeted_closure","evidence_valid":true},
+  {"name":"correction-introduces-contradiction","old_provider_calls":15,"new_broad_calls":5,"closure_calls":1,"old_elapsed_ms":360,"new_elapsed_ms":125,"old_plan_byte_growth":1700,"new_plan_byte_growth":310,"finding_ids":["CX-0001"],"closure_outcome":"closure_requires_new_review","evidence_valid":true}
+]
