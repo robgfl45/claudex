@@ -7,7 +7,7 @@ Resolve all paths before delegation:
 - `REPO`: trusted absolute git working-tree path
 - `PLAN`: absolute existing, non-empty plan path (normally `$REPO/PLAN.md`)
 - `ADAPTER`: installed/staged `bin/claudex-plan-review` absolute path
-- `PLUGIN_ROOT`: installed/staged `plugins/claudex` absolute path
+- optional `PLUGIN_ROOT`: only a deliberately reviewed plugin different from the checkout adapter's auto-discovered `plugins/claudex`
 - `CLAUDE`: vetted absolute Claude Code executable
 - `CODEX`: vetted absolute Codex executable
 - `EVIDENCE`: new absolute output directory
@@ -43,7 +43,7 @@ For the standard 3,600-second adapter run, keep the outer child at least 4,200 s
 
 Use a self-contained prompt equivalent to:
 
-> You are a leaf execution subagent. Do not ask Rob questions and do not delegate. Run exactly one bounded sweep-v2 adapter operation, then return exact JSON and absolute artifact paths. Repository: `<REPO>`. Existing plan: `<PLAN>`. Grounded topic: `<TOPIC>`. Risk tier: `<RISK_TIER>`. Generation cap: `<ROUNDS>`. Adapter: `<ADAPTER>`. Plugin root: `<PLUGIN_ROOT>`. Claude: `<CLAUDE>`. Codex: `<CODEX>`. Evidence: `<EVIDENCE>`. Run: `<ADAPTER> --repo <REPO> --plan <PLAN> --topic <TOPIC> --engine sweep-v2 --rounds <ROUNDS> --timeout 3600 --budget-usd 10 --plugin-root <PLUGIN_ROOT> --claude <CLAUDE> --codex <CODEX> --output-dir <EVIDENCE>`. Preserve stdout exactly. A nonzero exit is an outcome, not permission to improvise or restart. Do not implement, commit, push, install, or change global configuration. Verify result, plan, state, manifests, all persona artifacts, and process cleanup before returning.
+> You are a leaf execution subagent. Do not ask Rob questions and do not delegate. First run the complete adapter command with `--preflight-only`; proceed only when it returns `preflight_ok`. Then run exactly one bounded sweep-v2 adapter operation and return exact JSON and absolute artifact paths. Repository: `<REPO>`. Existing plan: `<PLAN>`. Grounded topic: `<TOPIC>`. Risk tier: `<RISK_TIER>`. Generation cap: `<ROUNDS>`. Adapter: `<ADAPTER>`. Claude: `<CLAUDE>`. Codex: `<CODEX>`. Evidence: `<EVIDENCE>`. Run: `<ADAPTER> --repo <REPO> --plan <PLAN> --topic <TOPIC> --engine sweep-v2 --rounds <ROUNDS> --timeout 3600 --budget-usd 10 --claude <CLAUDE> --codex <CODEX> --output-dir <EVIDENCE>`. Normally omit `--plugin-root` with the checkout adapter; add it only to pin a deliberately reviewed different plugin. Preserve stdout exactly. A nonzero exit is an outcome, not permission to improvise or restart. Do not implement, commit, push, install, or change global configuration. Verify result, plan, state, manifests, all persona artifacts, and process cleanup before returning.
 
 Do not omit context on the assumption the child can read the parent conversation.
 

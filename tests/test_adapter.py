@@ -2,6 +2,7 @@
 import json
 import os
 import signal
+import shutil
 import subprocess
 import tempfile
 import textwrap
@@ -200,25 +201,105 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         path.write_text(textwrap.dedent(content))
         path.chmod(0o755)
 
-    def run_adapter(self, outcome="sweep_clean", timeout="5", extra_env=None, engine="sweep-v2", rounds="1", plan=None, resume_id=None, topic="review the grounded plan"):
+    def run_adapter(self, outcome="sweep_clean", timeout="5", extra_env=None, engine="sweep-v2", rounds="1", plan=None, resume_id=None, topic="review the grounded plan", plugin_root=PLUGIN, preflight=False, output_dir=None, adapter=ADAPTER):
         env = os.environ.copy()
         env["FAKE_CLAUDE_OUTCOME"] = outcome
+        env["HOME"] = str(self.base / "home")
+        env.pop("CLAUDEX_PLUGIN_ROOT", None)
         if extra_env:
             env.update(extra_env)
         plan_path = Path(plan) if plan is not None else self.plan
         command = [
-            str(ADAPTER), "--repo", str(self.repo.resolve()), "--plan", str(plan_path.resolve()),
+            str(adapter), "--repo", str(self.repo.resolve()), "--plan", str(plan_path.resolve()),
             "--topic", topic, "--rounds", rounds, "--timeout", timeout,
-            "--budget-usd", "1.25", "--plugin-root", str(PLUGIN.resolve()),
+            "--budget-usd", "1.25",
             "--claude", str(self.claude.resolve()), "--codex", str(self.codex.resolve()),
             "--engine", engine,
         ]
+        if plugin_root is not None:
+            command.extend(["--plugin-root", str(Path(plugin_root).resolve())])
+        if preflight:
+            command.append("--preflight-only")
+        if output_dir is not None:
+            command.extend(["--output-dir", str(output_dir)])
         if resume_id is not None:
             command.extend(["--resume-review-id", resume_id])
         completed = subprocess.run(command, text=True, capture_output=True, env=env, timeout=10)
         lines = completed.stdout.splitlines()
         self.assertEqual(len(lines), 1, completed.stdout)
         return completed, json.loads(lines[0])
+
+    def copy_plugin(self, destination):
+        shutil.copytree(PLUGIN, destination)
+        return destination
+
+    def test_preflight_plugin_resolution_precedence_and_fail_closed(self):
+        completed, result = self.run_adapter(preflight=True)
+        self.assertEqual((completed.returncode, result["preflight"]["plugin_source"]), (0, "explicit"))
+        completed, result = self.run_adapter(preflight=True, plugin_root=None)
+        self.assertEqual((completed.returncode, result["preflight"]["plugin_source"]), (0, "adapter-relative"))
+        env_plugin = self.copy_plugin(self.base / "env-plugin")
+        completed, result = self.run_adapter(preflight=True, plugin_root=None, extra_env={"CLAUDEX_PLUGIN_ROOT": str(env_plugin)})
+        self.assertEqual((completed.returncode, result["preflight"]["plugin_source"]), (0, "environment"))
+        bad = self.base / "bad-plugin"
+        bad.mkdir()
+        for kwargs in ({"plugin_root": bad}, {"plugin_root": None, "extra_env": {"CLAUDEX_PLUGIN_ROOT": str(bad)}}):
+            completed, result = self.run_adapter(preflight=True, **kwargs)
+            self.assertEqual(completed.returncode, 12)
+            self.assertIn("invalid Claudex plugin candidate", result["error"]["message"])
+
+    def test_auto_discovery_zero_ambiguous_and_same_real_path(self):
+        standalone = self.base / "standalone" / "bin" / "claudex-plan-review"
+        standalone.parent.mkdir(parents=True)
+        shutil.copy2(ADAPTER, standalone)
+        standalone.chmod(0o755)
+        completed, result = self.run_adapter(preflight=True, plugin_root=None, adapter=standalone)
+        self.assertEqual(completed.returncode, 12)
+        self.assertIn("no valid Claudex plugin candidate", result["error"]["message"])
+        project_plugin = self.repo / ".claude" / "plugins" / "claudex"
+        self.copy_plugin(project_plugin)
+        completed, result = self.run_adapter(preflight=True, plugin_root=None)
+        self.assertEqual(completed.returncode, 12)
+        self.assertIn("ambiguous", result["error"]["message"])
+        shutil.rmtree(project_plugin)
+        project_plugin.symlink_to(PLUGIN, target_is_directory=True)
+        completed, _ = self.run_adapter(preflight=True, plugin_root=None)
+        self.assertEqual(completed.returncode, 0)
+
+    def test_sweep_helper_output_parent_and_preflight_side_effect_guards(self):
+        plugin = self.copy_plugin(self.base / "no-sweep")
+        (plugin / "scripts" / "sweep-helpers.sh").unlink()
+        completed, result = self.run_adapter(preflight=True, plugin_root=plugin)
+        self.assertEqual(completed.returncode, 12)
+        self.assertIn("sweep-helpers.sh", result["error"]["message"])
+        completed, _ = self.run_adapter(preflight=True, plugin_root=plugin, engine="legacy")
+        self.assertEqual(completed.returncode, 0)
+        marker = self.base / "provider-marker"
+        requested = self.base / "new" / "nested" / "evidence"
+        completed, result = self.run_adapter(preflight=True, output_dir=requested, extra_env={"FAKE_PROMPT_FILE": str(marker)})
+        self.assertEqual((completed.returncode, result["outcome"]), (0, "preflight_ok"))
+        self.assertFalse(requested.exists())
+        self.assertFalse((self.repo / ".claude" / "claudex").exists())
+        self.assertFalse(marker.exists())
+        blocked = self.base / "blocked"
+        blocked.mkdir()
+        blocked.chmod(0o555)
+        completed, result = self.run_adapter(preflight=True, output_dir=blocked / "evidence")
+        self.assertEqual(completed.returncode, 12)
+        self.assertIn("not writable", result["error"]["message"])
+        file_parent = self.base / "file-parent"
+        file_parent.write_text("x")
+        completed, result = self.run_adapter(preflight=True, output_dir=file_parent / "evidence")
+        self.assertEqual(completed.returncode, 12)
+        self.assertIn("not a directory", result["error"]["message"])
+
+    def test_preflight_version_and_auth_failures(self):
+        self._write_executable(self.claude, "#!/bin/sh\nexit 9\n")
+        _, result = self.run_adapter(preflight=True)
+        self.assertEqual(result["error"]["kind"], "prerequisite")
+        self._write_executable(self.claude, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 2.test; exit 0; fi\necho '{\"loggedIn\":false}'\n")
+        _, result = self.run_adapter(preflight=True)
+        self.assertEqual(result["error"]["kind"], "authentication")
 
     def test_source_runbook_uses_proportional_caps_resume_and_targeted_closure(self):
         skill_dir = ROOT / "skills" / "project-plan-review"
@@ -558,7 +639,8 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         self.assertEqual(len(completed.stdout.splitlines()), 1, completed.stdout)
         result = json.loads(completed.stdout)
         self.assertEqual(completed.returncode, 12)
-        self.assertEqual(result["error"]["kind"], "internal")
+        self.assertEqual(result["error"]["kind"], "validation")
+        self.assertIn("not a directory", result["error"]["message"])
 
     def test_relative_repo_is_rejected_as_json(self):
         completed = subprocess.run([

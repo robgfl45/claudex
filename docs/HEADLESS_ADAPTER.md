@@ -4,7 +4,7 @@
 
 ## Architecture
 
-1. The caller supplies absolute paths for a trusted git repository, an existing non-empty plan, the Claudex plugin, Claude Code, and Codex.
+1. The caller supplies absolute paths for a trusted git repository, an existing non-empty plan, Claude Code, and Codex. The adapter normally discovers the checkout-relative Claudex plugin.
 2. The adapter validates paths, plugin files, engine bounds, versions, and both CLI authentication states. It creates no global installation and uses `--plugin-dir` for this Claude session only.
 3. If the supplied plan is outside the repository, it is staged as `<repo>/PLAN.md`, reviewed, copied back, and any pre-existing repository plan is restored.
 4. Claude Code runs headlessly with `/claudex:plan --engine sweep-v2 --from-draft --skip-interview --rounds N`, stream-JSON output, hook events, an explicit telemetry budget, and a pinned child `PATH`.
@@ -25,13 +25,16 @@ Interactive review mode and the plugin's legacy plan mode are unchanged.
   --rounds 5 \
   --timeout 3600 \
   --budget-usd 10.00 \
-  --plugin-root /absolute/path/to/claudex/plugins/claudex \
   --claude /absolute/path/to/claude \
   --codex /absolute/path/to/codex \
   --output-dir /absolute/new/evidence-directory
 ```
 
 `--engine` defaults to `sweep-v2`; its `--rounds` value is the maximum generation count and must be `1..5`. The Hermes project-plan-review workflow uses five. Pass `--engine legacy` for backward-compatible round behavior. `--output-dir` is optional; the default is `.claude/claudex/adapter-runs/<timestamp>-<id>`. `--model` defaults to `sonnet`.
+
+Before a long or delegated review, run the same command with `--preflight-only`. It emits one compact JSON object after validating repository/plan, engine bounds, plugin, executable versions/authentication, and the nearest existing writable output parent. It creates no output directory, evidence, adapter lock, or `.claude/claudex` review state and launches no review request.
+
+Plugin precedence is explicit `--plugin-root`, `CLAUDEX_PLUGIN_ROOT`, adapter-relative `plugins/claudex`, project-local `.claude/plugins/claudex`, then (only when it exists) the user-managed `~/.claude/plugins/claudex` installation. Explicit/environment candidates fail closed when invalid. Automatic discovery reports every checked candidate and rejects zero or multiple distinct valid roots; symlinks to the same real root are not ambiguous. Normally omit `--plugin-root` when invoking the adapter from this checkout. Pin it only to select a deliberately reviewed different plugin.
 
 To continue an interrupted sweep, pass `--resume-review-id <id>` with the exact same canonical repository `PLAN.md`, topic, engine, and generation cap, plus a new empty output directory. Resume rejects active locks/processes and terminal or mismatched state before provider launch. It reuses only complete valid persona evidence from the current immutable generation and runs only missing personas; invalid existing evidence degrades without overwrite.
 

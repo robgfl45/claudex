@@ -271,6 +271,94 @@ def run_probe(argv: list[str], cwd: Path, env: dict[str, str], timeout: float = 
     return subprocess.run(argv, cwd=cwd, env=env, text=True, capture_output=True, timeout=timeout, check=False)
 
 
+def validate_plugin_candidate(path: Path, engine: str) -> tuple[Path | None, list[str]]:
+    """Validate one candidate without creating anything beneath it."""
+    errors: list[str] = []
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+    except OSError as exc:
+        return None, [f"does not exist: {exc}"]
+    if not resolved.is_dir():
+        return None, ["is not a directory"]
+    required = [
+        resolved / ".claude-plugin" / "plugin.json",
+        resolved / "commands" / "plan.md",
+        resolved / "hooks" / "hooks.json",
+        resolved / "hooks" / "stop-hook.sh",
+        resolved / "scripts" / "state-helpers.sh",
+    ]
+    if engine == "sweep-v2":
+        required += [resolved / "scripts" / "sweep-helpers.sh", resolved / "scripts" / "personas.sh"]
+    for item in required:
+        if not item.is_file():
+            errors.append(f"missing required file {item.relative_to(resolved)}")
+    manifest_path = resolved / ".claude-plugin" / "plugin.json"
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict) or manifest.get("name") != "claudex":
+                errors.append("manifest name must be claudex")
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            errors.append(f"manifest is unreadable or invalid JSON: {exc}")
+    return (resolved if not errors else None), errors
+
+
+def resolve_plugin(explicit: str | None, repo: Path, engine: str) -> tuple[Path, str, list[dict[str, Any]]]:
+    adapter = Path(__file__).resolve().parents[1] / "plugins" / "claudex"
+    env_value = os.environ.get("CLAUDEX_PLUGIN_ROOT")
+    if explicit is not None:
+        candidates = [("explicit", Path(explicit))]
+        fail_closed = True
+    elif env_value:
+        candidates = [("environment", Path(env_value))]
+        fail_closed = True
+    else:
+        candidates = [
+            ("adapter-relative", adapter),
+            ("project-local", repo / ".claude" / "plugins" / "claudex"),
+        ]
+        # This is intentionally the only installed-layout heuristic: a user-managed
+        # Claude plugin at ~/.claude/plugins/claudex. Cache/version layouts are not guessed.
+        installed = Path.home() / ".claude" / "plugins" / "claudex"
+        if installed.exists():
+            candidates.append(("installed-user-plugin", installed))
+        fail_closed = False
+    diagnostics: list[dict[str, Any]] = []
+    valid: list[tuple[str, Path]] = []
+    for source, candidate in candidates:
+        resolved, errors = validate_plugin_candidate(candidate, engine)
+        diagnostics.append({"source": source, "path": str(candidate), "valid": resolved is not None, "resolved_path": str(resolved) if resolved else None, "errors": errors})
+        if resolved:
+            valid.append((source, resolved))
+    if fail_closed and not valid:
+        detail = "; ".join(diagnostics[0]["errors"])
+        raise ValueError(f"invalid Claudex plugin candidate from {candidates[0][0]} ({candidates[0][1]}): {detail}")
+    distinct = {str(path): (source, path) for source, path in valid}
+    if not distinct:
+        checked = ", ".join(f"{item['source']}={item['path']}" for item in diagnostics)
+        raise ValueError(f"no valid Claudex plugin candidate; checked: {checked}")
+    if len(distinct) > 1:
+        choices = ", ".join(f"{source}={path}" for source, path in valid)
+        raise ValueError(f"ambiguous Claudex plugin candidates: {choices}; use --plugin-root to select one")
+    selected_path = next(iter(distinct.values()))[1]
+    selected_source = next(source for source, path in valid if path == selected_path)
+    return selected_path, selected_source, diagnostics
+
+
+def validate_output_parent(requested: Path) -> Path:
+    if not requested.is_absolute():
+        raise ValueError("--output-dir must be an absolute path")
+    current = requested
+    while not current.exists() and current != current.parent:
+        current = current.parent
+    if not current.is_dir():
+        raise ValueError(f"nearest existing output parent is not a directory: {current}")
+    mode = current.stat().st_mode
+    if mode & 0o222 == 0 or not os.access(current, os.W_OK | os.X_OK):
+        raise ValueError(f"nearest existing output parent is not writable: {current}")
+    return current
+
+
 def decode_state_value(key: str, value: str) -> str:
     parsed = value.strip()
     if key == "topic" and len(parsed) >= 2 and parsed.startswith('"') and parsed.endswith('"'):
@@ -665,12 +753,12 @@ def main() -> int:
     parser.add_argument("--resume-review-id", help="resume one interrupted sweep-v2 review ID")
     parser.add_argument("--timeout", required=True, type=float, help="wall-clock timeout in seconds")
     parser.add_argument("--budget-usd", required=True, help="positive Claude Code budget cap")
-    default_plugin = Path(__file__).resolve().parents[1] / "plugins" / "claudex"
-    parser.add_argument("--plugin-root", default=str(default_plugin), help="absolute Claudex plugin root")
+    parser.add_argument("--plugin-root", help="absolute Claudex plugin root (normally auto-discovered)")
     parser.add_argument("--claude", required=True, help="absolute Claude Code executable")
     parser.add_argument("--codex", required=True, help="absolute Codex executable")
     parser.add_argument("--output-dir", help="absolute evidence directory (must not already exist)")
     parser.add_argument("--model", default="sonnet", help="Claude model passed to headless Claude Code")
+    parser.add_argument("--preflight-only", action="store_true", help="validate prerequisites and emit JSON without starting a review")
     args = parser.parse_args()
 
     try:
@@ -678,7 +766,7 @@ def main() -> int:
         if not (repo / ".git").exists():
             raise ValueError(f"--repo must be a git working tree: {repo}")
         plan = absolute_existing_file(args.plan, "--plan")
-        plugin = absolute_existing_dir(args.plugin_root, "--plugin-root")
+        plugin, plugin_source, plugin_candidates = resolve_plugin(args.plugin_root, repo, args.engine)
         claude = executable(args.claude, "--claude")
         codex = executable(args.codex, "--codex")
         if args.rounds < 1:
@@ -697,17 +785,47 @@ def main() -> int:
             raise ValueError("--budget-usd must be a positive decimal") from exc
         if not budget.is_finite() or budget <= 0:
             raise ValueError("--budget-usd must be a positive decimal")
-        required = [plugin / ".claude-plugin" / "plugin.json", plugin / "commands" / "plan.md", plugin / "hooks" / "stop-hook.sh", plugin / "scripts" / "state-helpers.sh"]
-        if args.engine == "sweep-v2":
-            required.extend([plugin / "scripts" / "sweep-helpers.sh", plugin / "scripts" / "personas.sh"])
-        missing = [str(path) for path in required if not path.is_file()]
-        if missing:
-            raise ValueError("invalid Claudex plugin root; missing: " + ", ".join(missing))
-        manifest = json.loads(required[0].read_text(encoding="utf-8"))
-        if manifest.get("name") != "claudex":
-            raise ValueError(f"plugin manifest is not Claudex: {required[0]}")
+        if args.output_dir:
+            output_request = Path(args.output_dir)
+        else:
+            output_request = repo / ".claude" / "claudex" / "adapter-runs" / "preflight-placeholder"
+        output_parent = validate_output_parent(output_request)
     except (ValueError, OSError) as exc:
         return fail(str(exc))
+
+    env = os.environ.copy()
+    pinned_path = os.pathsep.join(dict.fromkeys([str(claude.parent), str(codex.parent), "/usr/bin", "/bin", "/usr/sbin", "/sbin"]))
+    env["PATH"] = pinned_path
+    preflight: dict[str, Any] = {
+        "pinned_path": pinned_path, "plugin_root": str(plugin), "plugin_source": plugin_source,
+        "plugin_candidates": plugin_candidates, "output_parent": str(output_parent),
+        "engine": args.engine, "rounds": args.rounds,
+    }
+    try:
+        claude_version = run_probe([str(claude), "--version"], repo, env)
+        codex_version = run_probe([str(codex), "--version"], repo, env)
+        claude_auth = run_probe([str(claude), "auth", "status"], repo, env)
+        codex_auth = run_probe([str(codex), "login", "status"], repo, env)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return fail(f"prerequisite probe failed: {exc}", kind="prerequisite")
+    preflight.update({
+        "claude": {"path": str(claude), "version": claude_version.stdout.strip()},
+        "codex": {"path": str(codex), "version": codex_version.stdout.strip()},
+        "claude_auth": claude_auth.stdout.strip(),
+        "codex_auth": (codex_auth.stdout + codex_auth.stderr).strip(),
+    })
+    if claude_version.returncode != 0 or codex_version.returncode != 0:
+        return fail("Claude or Codex version probe failed", kind="prerequisite")
+    try:
+        auth_obj = json.loads(claude_auth.stdout)
+    except json.JSONDecodeError:
+        auth_obj = {}
+    if claude_auth.returncode != 0 or auth_obj.get("loggedIn") is not True:
+        return fail("Claude Code authentication is not active", kind="authentication")
+    if codex_auth.returncode != 0 or "logged in" not in (codex_auth.stdout + codex_auth.stderr).lower():
+        return fail("Codex authentication is not active", kind="authentication")
+    if args.preflight_only:
+        return emit({"schema_version": 1, "outcome": "preflight_ok", "clean": True, "preflight": preflight}, 0)
 
     state_dir = repo / ".claude" / "claudex"
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -744,36 +862,8 @@ def main() -> int:
         return fail(f"evidence directory already exists: {evidence}")
     evidence.mkdir(parents=True)
 
-    env = os.environ.copy()
-    pinned_path = os.pathsep.join(dict.fromkeys([str(claude.parent), str(codex.parent), "/usr/bin", "/bin", "/usr/sbin", "/sbin"]))
-    env["PATH"] = pinned_path
     env["CLAUDEX_ADAPTER_EVIDENCE_DIR"] = str(evidence)
-
-    preflight: dict[str, Any] = {"pinned_path": pinned_path, "plugin_root": str(plugin)}
-    try:
-        claude_version = run_probe([str(claude), "--version"], repo, env)
-        codex_version = run_probe([str(codex), "--version"], repo, env)
-        claude_auth = run_probe([str(claude), "auth", "status"], repo, env)
-        codex_auth = run_probe([str(codex), "login", "status"], repo, env)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return fail(f"prerequisite probe failed: {exc}", kind="prerequisite", evidence_dir=evidence)
-    preflight.update({
-        "claude": {"path": str(claude), "version": claude_version.stdout.strip()},
-        "codex": {"path": str(codex), "version": codex_version.stdout.strip()},
-        "claude_auth": claude_auth.stdout.strip(),
-        "codex_auth": (codex_auth.stdout + codex_auth.stderr).strip(),
-    })
     (evidence / "preflight.json").write_text(json.dumps(preflight, indent=2, sort_keys=True) + "\n")
-    if claude_version.returncode != 0 or codex_version.returncode != 0:
-        return fail("Claude or Codex version probe failed", kind="prerequisite", evidence_dir=evidence)
-    try:
-        auth_obj = json.loads(claude_auth.stdout)
-    except json.JSONDecodeError:
-        auth_obj = {}
-    if claude_auth.returncode != 0 or auth_obj.get("loggedIn") is not True:
-        return fail("Claude Code authentication is not active", kind="authentication", evidence_dir=evidence)
-    if codex_auth.returncode != 0 or "logged in" not in (codex_auth.stdout + codex_auth.stderr).lower():
-        return fail("Codex authentication is not active", kind="authentication", evidence_dir=evidence)
 
     runtime_plan = repo / "PLAN.md"
     external_plan = plan != runtime_plan.resolve(strict=False)
