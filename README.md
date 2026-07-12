@@ -241,7 +241,7 @@ The Stop hook is fail-open everywhere. Any error returns `{"decision":"approve"}
 
 ### Bounded targeted closure
 
-`bin/claudex-plan-closure` is the separate Drake-owned readiness gate after review-v3 findings. It binds a trusted repository, review ID/topic, original and final plan hashes, exact registry digest, strict canonical disposition manifest, Codex executable, timeout, and new evidence directory. Every registry ID is dispositioned exactly once. Only `accept-and-correct` and `already-satisfied` rows receive one exact-risk verifier; reject/defer/risk decisions remain parent-owned. Closure emits exactly one JSON object and immutable copied evidence. Outcomes are `accepted_after_targeted_closure`, `blocked`, `closure_requires_new_review`, `degraded`, or `timed_out`—never `converged`. At most one second attempt may recheck only prior `not_closed` IDs; architecture/scope changes require a new full review-v3. Exact commands and schema: [`targeted-closure.md`](skills/project-plan-review/references/targeted-closure.md).
+`bin/claudex-plan-closure` is the separate Drake-owned readiness gate after review-v3 findings. It binds canonical `<repo>/PLAN.md`, complete repository state, review ID/topic, original and final plan hashes, exact registry digest, strict canonical disposition manifest, Codex executable, timeout, and new evidence directory. Every registry ID is dispositioned exactly once. Only `accept-and-correct` and `already-satisfied` rows receive one exact-risk verifier, and every verdict requires non-empty evidence; reject/defer/risk decisions remain parent-owned. Closure emits exactly one JSON object whose terminal-manifest SHA-256 anchors every final evidence byte. Read-only `--verify-evidence ... --expected-terminal-sha256 ...` reconstructs and verifies the chain. Outcomes are `accepted_after_targeted_closure`, `blocked`, `closure_requires_new_review`, `degraded`, or `timed_out`—never `converged`. At most one second attempt may recheck only `not_closed` IDs from an anchored, strictly validated attempt 1 using `--prior-evidence-dir` and `--prior-terminal-manifest-sha256`; architecture/scope changes require a new full review-v3. Exact commands and schema: [`targeted-closure.md`](skills/project-plan-review/references/targeted-closure.md).
 
 The staged repository skill uses authoritative leaf preflight → one `review-v3 --rounds 1` broad pass → Drake adjudication/correction → targeted closure. `sweep-v2` and legacy remain available for explicit rollback/exceptional use. Active Hermes installation/switch is prohibited until merged-head live proof and separate operator approval; this change does not modify `~/.hermes` or perform provider proof.
 
@@ -294,6 +294,7 @@ bash plugins/claudex/tests/review-v3-test.sh
 # Deterministic targeted-closure contract/lifecycle tests and offline benchmark
 python3 plugins/claudex/tests/closure-test.py
 python3 plugins/claudex/tests/closure-benchmark.py
+python3 plugins/claudex/tests/closure-benchmark-test.py
 
 # Headless adapter deterministic unit/error/timeout/state-isolation tests
 python3 -m unittest -v tests/test_adapter.py

@@ -34,6 +34,7 @@ Read the copied registry, original frozen plan, and result. Drakeâ€”not a modelâ
   "final_plan_sha256": "<64 lowercase hex>",
   "original_snapshot_sha256": "<64 lowercase hex>",
   "prior_result_sha256": null,
+  "prior_terminal_manifest_sha256": null,
   "registry_sha256": "<64 lowercase hex>",
   "repo_root": "/canonical/project",
   "review_id": "<exact registry review ID>",
@@ -59,10 +60,19 @@ Every registry ID appears exactly once; unknown, duplicate, and missing IDs fail
 
 Only `accept-and-correct` and `already-satisfied` rows launch Codex. Each read-only, ephemeral, ignore-rules verifier receives only the exact finding, original and final plans, changed sections, disposition/rationale, and repository context. It cannot create findings, edit plans, or decide ownership/risk acceptance.
 
-A single narrow recheck is allowed only for attempt-1 `not_closed` IDs. Create a new evidence directory and an attempt-2 manifest containing exactly those rows, binding `prior_result_sha256`, then add:
+A single narrow recheck is allowed only for genuine, fully validated attempt-1 `not_closed` IDs. Preserve the attempt-1 stdout `terminal_manifest_sha256` trust anchor. Create a new evidence directory and an attempt-2 manifest containing exactly those rows, binding both `prior_result_sha256` and `prior_terminal_manifest_sha256`, then add:
 
 ```bash
---prior-result /absolute/attempt-1/result.json
+--prior-evidence-dir /absolute/attempt-1/evidence \
+--prior-terminal-manifest-sha256 <preserved-stdout-digest>
+```
+
+Independently verify any terminal evidence read-only with:
+
+```bash
+/path/to/claudex/bin/claudex-plan-closure \
+  --verify-evidence /absolute/closure-evidence \
+  --expected-terminal-sha256 <preserved-stdout-digest>
 ```
 
 No third attempt exists. `closure_requires_new_review` cannot be rechecked; run a new full review-v3 against the changed architecture/scope contract.
@@ -75,7 +85,7 @@ No third attempt exists. `closure_requires_new_review` cannot be rechecked; run 
 - `degraded` (11): malformed, oversized, missing, identity-mismatched, mutated, incomplete, nonzero, or tampered evidence/process.
 - `timed_out` (124): adapter wall clock/cancellation; descendants are terminated and reaped.
 
-Stdout is exactly one JSON object and always records `adapter_converged: false`. Evidence includes immutable registry/original/final/manifest copies, per-ID raw output and prompts, events, process metadata, artifact digests, and canonical `result.json`. Registry IDs are immutable and never renumbered. Parent dispositions remain visible and are not model-overruled. No generic sweep follows automatically.
+Stdout is exactly one JSON object and always records `adapter_converged: false`; successful finalization adds the externally preservable `terminal_manifest_sha256`. The canonical terminal manifest binds every final evidence file by relative path, byte size, and SHA-256 plus result digest and review identity. Registry IDs are immutable and never renumbered. A `closed` verdict requires non-empty evidence. Parent dispositions remain visible and are not model-overruled. No generic sweep follows automatically.
 
 ## Staged rollout and rollback
 
