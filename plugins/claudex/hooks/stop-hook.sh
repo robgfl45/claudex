@@ -206,6 +206,30 @@ RUNNEREOF
   chmod +x "$RUNNER"
 }
 
+# === REVIEW-V3 READ-ONLY LIFECYCLE ===
+if [ "$MODE" = "plan" ] && [ "$ENGINE" = "review-v3" ]; then
+  GENERATION_DIR="$REVIEW_DIR/generations/1"
+  case "$PHASE" in
+    reviewing)
+      block "### Claudex review-v3 (experimental)\n\nRun all five read-only personas once against the frozen snapshot:\n\n\`bash $RUNNER\`\n\nReviewers must not modify PLAN.md or repository files. End your turn after the runner exits."
+      ;;
+    summarizing)
+      SIGNAL=$(claudex_state_read_field "$ACTIVE_STATE" decision_signal)
+      claudex_state_set_field "$ACTIVE_STATE" phase done
+      rm -f "$RUNNER" "$STATE_DIR/$REVIEW_ID.lock" "$STATE_DIR/$REVIEW_ID-active-pgid" 2>/dev/null
+      if [ "$SIGNAL" = converged ]; then
+        block "### Claudex review-v3 complete ✓\n\nAll five personas returned valid clean structured results against one frozen hash. Print this summary, then end your turn."
+      elif [ "$SIGNAL" = findings-returned ]; then
+        block "### Claudex review-v3 findings returned\n\nStructured material findings are in \`$GENERATION_DIR/findings-registry.json\` and \`$GENERATION_DIR/consolidated-findings.md\`. This is non-clean and no remedy has been accepted. Print this summary, then end your turn."
+      else
+        block "### Claudex review-v3 degraded\n\nEvidence was missing, malformed, nonzero, timed out, or mutated. No clean result is claimed."
+      fi
+      ;;
+    done) approve "review-v3 done" ;;
+    *) approve "unknown review-v3 phase" ;;
+  esac
+fi
+
 # === SWEEP-V2 PLAN LIFECYCLE ===
 
 if [ "$MODE" = "plan" ] && [ "$ENGINE" = "sweep-v2" ]; then

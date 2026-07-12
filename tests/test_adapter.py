@@ -720,6 +720,17 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         self.assertNotEqual(result1["review_id"], result2["review_id"])
         self.assertNotEqual(result1["state_file"], result2["state_file"])
 
+    def test_review_v3_preflight_and_exact_one_round_gate(self):
+        completed, result = self.run_adapter(preflight=True, engine="review-v3", rounds="1")
+        self.assertEqual((completed.returncode, result["outcome"]), (0, "preflight_ok"))
+        self.assertEqual(result["preflight"]["engine"], "review-v3")
+        self.assertFalse((self.repo / ".claude" / "claudex").exists())
+        marker = self.base / "review-v3-provider"
+        completed, result = self.run_adapter(preflight=True, engine="review-v3", rounds="2", extra_env={"FAKE_PROMPT_FILE": str(marker)})
+        self.assertEqual(completed.returncode, 12)
+        self.assertIn("requires --rounds 1", result["error"]["message"])
+        self.assertFalse(marker.exists())
+
     def test_sweep_generation_cap_is_rejected_before_launch(self):
         completed, result = self.run_adapter(rounds="6")
         self.assertEqual(completed.returncode, 12)

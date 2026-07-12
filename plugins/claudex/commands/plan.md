@@ -1,6 +1,6 @@
 ---
-description: Run an autonomous plan-and-review loop. Claude drafts PLAN.md, Codex grills it adversarially, Claude revises until LGTM or N rounds.
-argument-hint: '[--engine sweep-v2] [--rounds N] [--from-draft | --resume-review-id ID] [--skip-interview] <feature description>'
+description: Run legacy/sweep plan loops or the opt-in frozen read-only review-v3 engine.
+argument-hint: '[--engine review-v3|sweep-v2] [--rounds N] [--from-draft | --resume-review-id ID] [--skip-interview] <feature description>'
 allowed-tools: Bash, Read, Write, Edit, AskUserQuestion
 ---
 
@@ -18,6 +18,7 @@ Parse these flags from the start of $ARGUMENTS (the script handles them; you mai
 - `--from-draft`. Use the existing `PLAN.md` in the project root instead of drafting from scratch. PLAN.md must exist and be non-empty.
 - `--skip-interview`. Bypass the topic-sharpening interview offer in step 2 below. Useful when you've already nailed the topic or you're in a rush.
 - `--engine sweep-v2`. Opt into the Phase 1 frozen-snapshot engine. It requires an existing non-empty `PLAN.md`, runs all five required personas sequentially per generation, defaults to five generations, and never permits more than five. Omit this flag for unchanged legacy plan mode.
+- `--engine review-v3`. Experimental opt-in frozen, read-only, exactly-one-generation review. Requires `--rounds 1` and existing `PLAN.md`; all five personas emit schema-validated JSON and the runner assigns stable `CX-0001` IDs. It never revises the plan.
 - `--resume-review-id ID`. Resume one interrupted sweep-v2 review with exact repository, topic, canonical plan path, and maximum-generation binding. Valid completed same-generation persona evidence is reused; invalid evidence degrades and is never replaced.
 
 ## Procedure

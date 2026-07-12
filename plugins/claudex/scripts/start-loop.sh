@@ -118,8 +118,8 @@ case "$MODE" in
       echo "Plan mode requires a topic. Usage: start-loop.sh plan <topic>" >&2
       exit 2
     fi
-    if [ "$ENGINE" != "legacy" ] && [ "$ENGINE" != "sweep-v2" ]; then
-      echo "Unknown plan engine: $ENGINE. Use sweep-v2 or omit --engine for legacy mode." >&2
+    if [ "$ENGINE" != "legacy" ] && [ "$ENGINE" != "sweep-v2" ] && [ "$ENGINE" != "review-v3" ]; then
+      echo "Unknown plan engine: $ENGINE. Use review-v3, sweep-v2, or omit --engine for legacy mode." >&2
       exit 2
     fi
     if [ "$ENGINE" = "sweep-v2" ]; then
@@ -139,6 +139,11 @@ case "$MODE" in
         echo "sweep-v2 has a hard maximum of five generations." >&2
         exit 2
       fi
+    fi
+    if [ "$ENGINE" = "review-v3" ]; then
+      [ "$CUSTOM_ROUNDS" = "1" ] || { echo "review-v3 requires --rounds 1." >&2; exit 2; }
+      [ -s PLAN.md ] || { echo "review-v3 requires an existing non-empty PLAN.md." >&2; exit 2; }
+      [ -x "$CLAUDE_PLUGIN_ROOT/scripts/review-v3.py" ] || { echo "review-v3 runner is missing or not executable." >&2; exit 2; }
     fi
     ;;
   review)
@@ -326,8 +331,8 @@ MAX_PLAN_ROUNDS="${CLAUDEX_MAX_PLAN_ROUNDS:-3}"
 MAX_REVIEW_ROUNDS="${CLAUDEX_MAX_REVIEW_ROUNDS:-3}"
 
 if [ "$MODE" = "plan" ]; then
-  if [ "$ENGINE" = "sweep-v2" ]; then
-    MAX_ROUNDS=5
+  if [ "$ENGINE" = "sweep-v2" ] || [ "$ENGINE" = "review-v3" ]; then
+    MAX_ROUNDS=$([ "$ENGINE" = "review-v3" ] && echo 1 || echo 5)
     PHASE="reviewing"
   else
     MAX_ROUNDS="$MAX_PLAN_ROUNDS"
@@ -379,6 +384,16 @@ coverage_complete: false
 clean: false
 revision_required: false"
 fi
+if [ "$ENGINE" = "review-v3" ]; then
+  STATE_CONTENT="$STATE_CONTENT
+engine: review-v3
+generation: 1
+max_generations: 1
+snapshot_sha256:
+coverage_complete: false
+clean: false
+revision_required: false"
+fi
 
 claudex_state_write "$STATE_FILE" "$STATE_CONTENT" || exit 3
 claudex_lock_write "$LOCK_FILE" || exit 3
@@ -398,6 +413,25 @@ if [ "$ENGINE" = "sweep-v2" ]; then
     echo "Failed to create sweep-v2 runner." >&2
     exit 3
   }
+fi
+if [ "$ENGINE" = "review-v3" ]; then
+  GENERATION_DIR="$CLAUDEX_STATE_DIR/$REVIEW_ID/generations/1"
+  mkdir -p "$GENERATION_DIR" || exit 3
+  cp PLAN.md "$GENERATION_DIR/PLAN.md" || exit 3
+  chmod a-w "$GENERATION_DIR/PLAN.md" 2>/dev/null || true
+  SNAPSHOT_SHA=$(shasum -a 256 "$GENERATION_DIR/PLAN.md" | awk '{print $1}') || exit 3
+  python3 - "$GENERATION_DIR/manifest.json" "$REVIEW_ID" "$SNAPSHOT_SHA" "$TOPIC" "$REPO_ROOT" <<'PY'
+import json,pathlib,sys
+p,r,s,t,repo=sys.argv[1:]
+ids=["architecture-scope","security-data","product-domain","quality-accessibility-performance","operations-deployment"]
+pathlib.Path(p).write_text(json.dumps({"schema_version":1,"review_id":r,"engine":"review-v3","generation":1,"snapshot_sha256":s,"required_persona_ids":ids,"topic":t,"repo_root":repo,"source_plan_path":repo+"/PLAN.md"},indent=2,sort_keys=True)+"\n")
+PY
+  claudex_state_set_field "$STATE_FILE" snapshot_sha256 "$SNAPSHOT_SHA"
+  cat > "$CLAUDEX_STATE_DIR/$REVIEW_ID-runner.sh" <<EOF
+#!/usr/bin/env bash
+exec python3 "$CLAUDE_PLUGIN_ROOT/scripts/review-v3.py" --state "$STATE_FILE" --review-dir "$CLAUDEX_STATE_DIR/$REVIEW_ID" --review-id "$REVIEW_ID" --topic "$TOPIC" --repo "$REPO_ROOT" --codex "\${CLAUDEX_CODEX_BIN:-codex}" --timeout "\${CLAUDEX_SWEEP_PERSONA_TIMEOUT_SECONDS:-300}"
+EOF
+  chmod +x "$CLAUDEX_STATE_DIR/$REVIEW_ID-runner.sh"
 fi
 
 # Print initial instructions to stdout. Claude will read these.
