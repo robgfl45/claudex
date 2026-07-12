@@ -34,8 +34,10 @@ if mode=='mutate':
  elif kind=='symlink': target.unlink(); target.symlink_to('other-target')
  else: target.write_text(target.read_text()+'changed')
 verdict={'closed':'closed','not_closed':'not_closed','architecture':'closure_requires_new_review','id_mismatch':'closed','empty_evidence':'closed'}.get(mode,'closed'); out={'finding_id':'CX-9999' if mode=='id_mismatch' else fid,'verdict':verdict,'evidence':[] if mode=='empty_evidence' else ['final plan Safety section'],'reason':'exact risk assessment'}
+if mode=='extra_key': out['unexpected']=True
 if mode=='malformed': raw.write_text('{')
 elif mode=='oversized': raw.write_bytes(b' '*((2*1024*1024)+1))
+elif mode=='noncanonical': raw.write_text('{ "reason" : "exact risk assessment", "evidence" : [ "final plan Safety section" ], "verdict" : "closed", "finding_id" : "'+fid+'" }')
 else: raw.write_text(json.dumps(out,indent=2,sort_keys=True)+'\\n')
 '''); self.codex.chmod(0o755)
  def run_cli(self,rows=None,mode=None,attempt=1,prior_path=None,extra=None,timeout=5,rewrite=True):
@@ -54,6 +56,11 @@ else: raw.write_text(json.dumps(out,indent=2,sort_keys=True)+'\\n')
  def test_model_id_mismatch(self): self.assertOutcome('degraded',mode='id_mismatch')
  def test_malformed(self): self.assertOutcome('degraded',mode='malformed')
  def test_oversized(self): self.assertOutcome('degraded',mode='oversized')
+ def test_extra_key(self): self.assertOutcome('degraded',mode='extra_key')
+ def test_noncanonical_provider_output_is_normalized_and_verified(self):
+  p,r,o=self.assertOutcome('accepted_after_targeted_closure',mode='noncanonical'); raw=o/'verifiers/CX-0001.raw.json'
+  self.assertEqual(raw.read_bytes(),canon(json.loads(raw.read_bytes())).encode('utf-8')); self.assertTrue(raw.read_bytes().endswith(b'\n'))
+  verified,obj=self.verify(o,r['terminal_manifest_sha256']); self.assertEqual(verified.returncode,0); self.assertTrue(obj['verified'])
  def test_nonzero(self): self.assertOutcome('degraded',mode='nonzero')
  def test_timeout_and_descendant_cleanup(self):
   p,r,o=self.assertOutcome('timed_out',mode='timeout',timeout=.2); self.assertEqual(p.returncode,124); pids=[int(x) for x in (self.d/'pids').read_text().split()]

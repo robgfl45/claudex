@@ -144,7 +144,9 @@ def main():
    if rc!=0: outcome="degraded"; error=f"reviewer nonzero for {fid}: {rc}"; break
    if repo_state(repo,output)!=before or repo_state(repo,output)!=baseline: raise ValueError("repository mutation detected")
    if c.sha(final)!=final_sha: raise ValueError("final plan hash mutated")
-   obj=c.load_json(raw); c.validate_verifier(obj,fid); verifications.append(obj); event(events,"verifier_complete",finding_id=fid,verdict=obj["verdict"])
+   # Provider formatting is not a trust boundary: accept bounded UTF-8 JSON,
+   # validate the exact verifier contract, then freeze canonical evidence.
+   obj=c.load_json(raw,require_canonical=False); c.validate_verifier(obj,fid); atom(raw,c.canonical(obj).encode("utf-8")); verifications.append(obj); event(events,"verifier_complete",finding_id=fid,verdict=obj["verdict"])
    if obj["verdict"]=="closure_requires_new_review": outcome="closure_requires_new_review"; break
    if obj["verdict"]=="not_closed": outcome="blocked"
   if INTERRUPTED: outcome="timed_out"; error="adapter was cancelled"
