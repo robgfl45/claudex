@@ -201,7 +201,7 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         path.write_text(textwrap.dedent(content))
         path.chmod(0o755)
 
-    def run_adapter(self, outcome="sweep_clean", timeout="5", extra_env=None, engine="sweep-v2", rounds="1", plan=None, resume_id=None, topic="review the grounded plan", plugin_root=PLUGIN, preflight=False, output_dir=None, adapter=ADAPTER):
+    def run_adapter(self, outcome="sweep_clean", timeout="5", extra_env=None, engine="sweep-v2", rounds="1", plan=None, resume_id=None, topic="review the grounded plan", plugin_root=PLUGIN, preflight=False, output_dir=None, adapter=ADAPTER, raw_plugin_root=False):
         env = os.environ.copy()
         env["FAKE_CLAUDE_OUTCOME"] = outcome
         env["HOME"] = str(self.base / "home")
@@ -217,7 +217,8 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
             "--engine", engine,
         ]
         if plugin_root is not None:
-            command.extend(["--plugin-root", str(Path(plugin_root).resolve())])
+            plugin_value = str(plugin_root) if raw_plugin_root else str(Path(plugin_root).resolve())
+            command.extend(["--plugin-root", plugin_value])
         if preflight:
             command.append("--preflight-only")
         if output_dir is not None:
@@ -232,6 +233,19 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
     def copy_plugin(self, destination):
         shutil.copytree(PLUGIN, destination)
         return destination
+
+    def assert_preflight_evidence(self, result, engine, rounds):
+        preflight = json.loads((Path(result["evidence_dir"]) / "preflight.json").read_text())
+        self.assertEqual(preflight["plugin_root"], str(PLUGIN.resolve()))
+        self.assertEqual(preflight["plugin_source"], "explicit")
+        self.assertEqual(preflight["engine"], engine)
+        self.assertEqual(preflight["rounds"], rounds)
+        self.assertEqual(preflight["output_parent"], str(self.repo.resolve()))
+        self.assertTrue(preflight["plugin_candidates"])
+        self.assertIn(str(self.bin.resolve()), preflight["pinned_path"])
+        for key in ("claude_version", "codex_version", "claude_auth", "codex_auth"):
+            self.assertEqual(preflight[key]["returncode"], 0)
+            self.assertIn("stdout", preflight[key])
 
     def test_preflight_plugin_resolution_precedence_and_fail_closed(self):
         completed, result = self.run_adapter(preflight=True)
@@ -301,6 +315,84 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         _, result = self.run_adapter(preflight=True)
         self.assertEqual(result["error"]["kind"], "authentication")
 
+    def test_relative_plugin_overrides_are_rejected_without_resolution(self):
+        for kwargs, expected in (
+            ({"plugin_root": "plugins/claudex", "raw_plugin_root": True}, "--plugin-root must be an absolute path"),
+            ({"plugin_root": None, "extra_env": {"CLAUDEX_PLUGIN_ROOT": "plugins/claudex"}}, "CLAUDEX_PLUGIN_ROOT must be an absolute path"),
+        ):
+            with self.subTest(expected=expected):
+                completed, result = self.run_adapter(preflight=True, **kwargs)
+                self.assertEqual(completed.returncode, 12)
+                self.assertIn(expected, result["error"]["message"])
+
+    def test_plugin_manifest_hooks_required_files_and_permissions(self):
+        mutations = (
+            ("empty-plugin", lambda root: (root / ".claude-plugin" / "plugin.json").write_text(""), "empty"),
+            ("malformed-plugin", lambda root: (root / ".claude-plugin" / "plugin.json").write_text("{"), "invalid JSON"),
+            ("wrong-name", lambda root: (root / ".claude-plugin" / "plugin.json").write_text('{"name":"other"}'), "name must be claudex"),
+            ("empty-hooks", lambda root: (root / "hooks" / "hooks.json").write_text("{}"), "usable Stop hooks"),
+            ("malformed-hooks", lambda root: (root / "hooks" / "hooks.json").write_text("["), "invalid JSON"),
+            ("empty-command", lambda root: (root / "commands" / "plan.md").write_text(""), "required file is empty"),
+            ("missing-helper", lambda root: (root / "scripts" / "state-helpers.sh").unlink(), "missing required file"),
+            ("non-executable", lambda root: (root / "hooks" / "stop-hook.sh").chmod(0o644), "not executable"),
+        )
+        for name, mutate, expected in mutations:
+            with self.subTest(name=name):
+                plugin = self.copy_plugin(self.base / name)
+                mutate(plugin)
+                completed, result = self.run_adapter(preflight=True, plugin_root=plugin)
+                self.assertEqual(completed.returncode, 12)
+                self.assertIn(expected, result["error"]["message"])
+
+    def test_installed_user_plugin_discovery_is_home_isolated(self):
+        standalone = self.base / "standalone-installed" / "bin" / "claudex-plan-review"
+        standalone.parent.mkdir(parents=True)
+        shutil.copy2(ADAPTER, standalone)
+        standalone.chmod(0o755)
+        installed = self.copy_plugin(self.base / "home" / ".claude" / "plugins" / "claudex")
+        completed, result = self.run_adapter(preflight=True, plugin_root=None, adapter=standalone)
+        self.assertEqual((completed.returncode, result["preflight"]["plugin_source"]), (0, "installed-user-plugin"))
+        project = self.copy_plugin(self.repo / ".claude" / "plugins" / "claudex")
+        completed, result = self.run_adapter(preflight=True, plugin_root=None)
+        self.assertEqual(completed.returncode, 12)
+        self.assertIn("ambiguous", result["error"]["message"])
+        self.assertIn(str(installed.resolve()), result["error"]["message"])
+        self.assertIn(str(project.resolve()), result["error"]["message"])
+
+    def test_codex_probes_fail_closed_and_normal_failures_preserve_evidence(self):
+        cases = (
+            ("#!/bin/sh\nif [ \"$1\" = --version ]; then exit 7; fi\necho 'Logged in using ChatGPT'\n", "prerequisite"),
+            ("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 0.test; else exit 8; fi\n", "authentication"),
+            ("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 0.test; else echo 'Not logged in'; fi\n", "authentication"),
+        )
+        for index, (script, kind) in enumerate(cases):
+            with self.subTest(index=index):
+                self._write_executable(self.codex, script)
+                evidence = self.base / f"probe-failure-{index}"
+                marker = self.base / f"provider-{index}"
+                completed, result = self.run_adapter(output_dir=evidence, extra_env={"FAKE_PROMPT_FILE": str(marker)})
+                self.assertEqual(completed.returncode, 12)
+                self.assertEqual(result["error"]["kind"], kind)
+                self.assertEqual(result["evidence_dir"], str(evidence))
+                diagnostics = json.loads((evidence / "preflight.json").read_text())
+                self.assertIn("codex_version", diagnostics)
+                self.assertFalse(marker.exists())
+                self.assertFalse((self.repo / ".claude" / "claudex").exists())
+
+    def test_probe_timeout_emits_one_json_without_state_or_review(self):
+        self._write_executable(self.codex, "#!/bin/sh\nsleep 2\n")
+        evidence = self.base / "probe-timeout"
+        marker = self.base / "provider-timeout"
+        completed, result = self.run_adapter(
+            output_dir=evidence,
+            extra_env={"CLAUDEX_TEST_PROBE_TIMEOUT": "0.05", "FAKE_PROMPT_FILE": str(marker)},
+        )
+        self.assertEqual(completed.returncode, 12)
+        self.assertEqual(result["error"]["kind"], "prerequisite")
+        self.assertIn("TimeoutExpired", (evidence / "preflight.json").read_text())
+        self.assertFalse(marker.exists())
+        self.assertFalse((self.repo / ".claude" / "claudex").exists())
+
     def test_source_runbook_uses_proportional_caps_resume_and_targeted_closure(self):
         skill_dir = ROOT / "skills" / "project-plan-review"
         runbook = (skill_dir / "references" / "runbook.md").read_text()
@@ -325,6 +417,10 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         self.assertIn("accepted_after_targeted_closure", targeted)
         self.assertIn("adapter_converged: false", targeted)
         self.assertIn("Do **not** rerun all five personas automatically", targeted)
+        self.assertIn("leaf owns the authoritative preflight", skill)
+        self.assertIn("never substitutes for the leaf preflight", skill)
+        self.assertIn("leaf's preflight is authoritative", runbook)
+        self.assertIn("must not treat that as permission to skip the leaf preflight", runbook)
         self.assertIn("targeted-closure.md", resumed)
         self.assertIn("subscription-backed", runbook)
 
@@ -344,6 +440,7 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
             self.assertTrue(Path(result[key]).exists(), key)
             self.assertTrue(str(Path(result[key])).startswith(result["evidence_dir"]))
         self.assertEqual(Path(result["source_state_file"]).read_bytes(), Path(result["evidence_state_file"]).read_bytes())
+        self.assert_preflight_evidence(result, "sweep-v2", 1)
         source_generation = self.repo / ".claude" / "claudex" / result["review_id"] / "generations" / str(result["generation"])
         copied_generation = Path(result["generation_evidence_dir"])
         for artifact in ["PLAN.md", "manifest.json", "consolidated-findings.md"] + [f"{persona}.{suffix}" for persona in PERSONAS for suffix in ("findings.md", "result.json")]:
@@ -461,6 +558,7 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         self.assertEqual((result["round"], result["max_rounds"]), (1, 1))
         self.assertIsNone(result["generation"])
         self.assertTrue(Path(result["final_findings"]).is_file())
+        self.assert_preflight_evidence(result, "legacy", 1)
 
     def test_legacy_signal_cannot_override_material_findings(self):
         completed, result = self.run_adapter("legacy_degraded", engine="legacy")

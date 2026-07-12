@@ -292,14 +292,45 @@ def validate_plugin_candidate(path: Path, engine: str) -> tuple[Path | None, lis
     for item in required:
         if not item.is_file():
             errors.append(f"missing required file {item.relative_to(resolved)}")
+        else:
+            try:
+                if item.stat().st_size == 0:
+                    errors.append(f"required file is empty {item.relative_to(resolved)}")
+            except OSError as exc:
+                errors.append(f"required file is unreadable {item.relative_to(resolved)}: {exc}")
     manifest_path = resolved / ".claude-plugin" / "plugin.json"
     if manifest_path.is_file():
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if not isinstance(manifest, dict) or manifest.get("name") != "claudex":
+            if not isinstance(manifest, dict) or not manifest:
+                errors.append("manifest must be a non-empty JSON object")
+            elif manifest.get("name") != "claudex":
                 errors.append("manifest name must be claudex")
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             errors.append(f"manifest is unreadable or invalid JSON: {exc}")
+    hooks_path = resolved / "hooks" / "hooks.json"
+    if hooks_path.is_file() and hooks_path.stat().st_size:
+        try:
+            hooks_manifest = json.loads(hooks_path.read_text(encoding="utf-8"))
+            stop = hooks_manifest.get("hooks", {}).get("Stop") if isinstance(hooks_manifest, dict) else None
+            usable = (
+                isinstance(hooks_manifest, dict) and bool(hooks_manifest)
+                and isinstance(stop, list) and bool(stop)
+                and all(isinstance(group, dict) and isinstance(group.get("hooks"), list) and bool(group["hooks"]) for group in stop)
+                and any(
+                    isinstance(hook, dict)
+                    and hook.get("type") == "command"
+                    and hook.get("command") == "${CLAUDE_PLUGIN_ROOT}/hooks/stop-hook.sh"
+                    for group in stop for hook in group["hooks"]
+                )
+            )
+            if not usable:
+                errors.append("hooks manifest must be a non-empty object with the checked-in usable Stop hooks mapping")
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            errors.append(f"hooks manifest is unreadable or invalid JSON: {exc}")
+    stop_hook = resolved / "hooks" / "stop-hook.sh"
+    if stop_hook.is_file() and stop_hook.stat().st_size and not os.access(stop_hook, os.X_OK):
+        errors.append("directly executed hooks/stop-hook.sh is not executable")
     return (resolved if not errors else None), errors
 
 
@@ -307,9 +338,13 @@ def resolve_plugin(explicit: str | None, repo: Path, engine: str) -> tuple[Path,
     adapter = Path(__file__).resolve().parents[1] / "plugins" / "claudex"
     env_value = os.environ.get("CLAUDEX_PLUGIN_ROOT")
     if explicit is not None:
+        if not Path(explicit).is_absolute():
+            raise ValueError("--plugin-root must be an absolute path")
         candidates = [("explicit", Path(explicit))]
         fail_closed = True
     elif env_value:
+        if not Path(env_value).is_absolute():
+            raise ValueError("CLAUDEX_PLUGIN_ROOT must be an absolute path")
         candidates = [("environment", Path(env_value))]
         fail_closed = True
     else:
@@ -801,29 +836,65 @@ def main() -> int:
         "plugin_candidates": plugin_candidates, "output_parent": str(output_parent),
         "engine": args.engine, "rounds": args.rounds,
     }
-    try:
-        claude_version = run_probe([str(claude), "--version"], repo, env)
-        codex_version = run_probe([str(codex), "--version"], repo, env)
-        claude_auth = run_probe([str(claude), "auth", "status"], repo, env)
-        codex_auth = run_probe([str(codex), "login", "status"], repo, env)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return fail(f"prerequisite probe failed: {exc}", kind="prerequisite")
-    preflight.update({
-        "claude": {"path": str(claude), "version": claude_version.stdout.strip()},
-        "codex": {"path": str(codex), "version": codex_version.stdout.strip()},
-        "claude_auth": claude_auth.stdout.strip(),
-        "codex_auth": (codex_auth.stdout + codex_auth.stderr).strip(),
-    })
+
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    evidence = Path(args.output_dir) if args.output_dir else repo / ".claude" / "claudex" / "adapter-runs" / f"{stamp}-{uuid.uuid4().hex[:8]}"
+    if evidence.exists():
+        return fail(f"evidence directory already exists: {evidence}")
+
+    def persist_probe_failure(message: str, kind: str) -> int:
+        if args.preflight_only:
+            return fail(message, kind=kind)
+        try:
+            evidence.mkdir(parents=True)
+            (evidence / "preflight.json").write_text(json.dumps(preflight, indent=2, sort_keys=True) + "\n")
+        except OSError as exc:
+            message += f"; preflight evidence write failed: {exc}"
+        return fail(message, kind=kind, evidence_dir=evidence)
+
+    probe_timeout = 20.0
+    test_timeout = os.environ.get("CLAUDEX_TEST_PROBE_TIMEOUT")
+    if test_timeout:
+        try:
+            probe_timeout = max(0.01, min(20.0, float(test_timeout)))
+        except ValueError:
+            return persist_probe_failure("invalid internal probe timeout", "prerequisite")
+
+    probes: dict[str, subprocess.CompletedProcess[str]] = {}
+    probe_commands = (
+        ("claude_version", [str(claude), "--version"]),
+        ("codex_version", [str(codex), "--version"]),
+        ("claude_auth", [str(claude), "auth", "status"]),
+        ("codex_auth", [str(codex), "login", "status"]),
+    )
+    for name, command in probe_commands:
+        try:
+            completed = run_probe(command, repo, env, timeout=probe_timeout)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            preflight[name] = {"error": f"{type(exc).__name__}: {exc}"}
+            return persist_probe_failure(f"prerequisite probe failed ({name}): {exc}", "prerequisite")
+        probes[name] = completed
+        preflight[name] = {
+            "path": command[0], "returncode": completed.returncode,
+            "stdout": completed.stdout.strip(), "stderr": completed.stderr.strip(),
+        }
+
+    claude_version = probes["claude_version"]
+    codex_version = probes["codex_version"]
+    claude_auth = probes["claude_auth"]
+    codex_auth = probes["codex_auth"]
     if claude_version.returncode != 0 or codex_version.returncode != 0:
-        return fail("Claude or Codex version probe failed", kind="prerequisite")
+        return persist_probe_failure("Claude or Codex version probe failed", "prerequisite")
     try:
         auth_obj = json.loads(claude_auth.stdout)
     except json.JSONDecodeError:
         auth_obj = {}
     if claude_auth.returncode != 0 or auth_obj.get("loggedIn") is not True:
-        return fail("Claude Code authentication is not active", kind="authentication")
-    if codex_auth.returncode != 0 or "logged in" not in (codex_auth.stdout + codex_auth.stderr).lower():
-        return fail("Codex authentication is not active", kind="authentication")
+        return persist_probe_failure("Claude Code authentication is not active", "authentication")
+    codex_auth_text = (codex_auth.stdout + "\n" + codex_auth.stderr).strip()
+    codex_positive = {"Logged in using ChatGPT"}
+    if codex_auth.returncode != 0 or codex_auth_text not in codex_positive:
+        return persist_probe_failure("Codex authentication is not active", "authentication")
     if args.preflight_only:
         return emit({"schema_version": 1, "outcome": "preflight_ok", "clean": True, "preflight": preflight}, 0)
 
@@ -850,20 +921,12 @@ def main() -> int:
         if phase in ACTIVE_PHASES or (phase and phase not in TERMINAL_PHASES):
             return fail(f"active Claudex loop already exists: {state_file} (phase={phase})", kind="active_loop")
 
-    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    if args.output_dir:
-        output_dir_arg = Path(args.output_dir)
-        if not output_dir_arg.is_absolute():
-            return fail("--output-dir must be an absolute path")
-        evidence = output_dir_arg
-    else:
-        evidence = state_dir / "adapter-runs" / f"{stamp}-{uuid.uuid4().hex[:8]}"
-    if evidence.exists():
-        return fail(f"evidence directory already exists: {evidence}")
-    evidence.mkdir(parents=True)
-
+    try:
+        evidence.mkdir(parents=True)
+        (evidence / "preflight.json").write_text(json.dumps(preflight, indent=2, sort_keys=True) + "\n")
+    except OSError as exc:
+        return fail(f"could not create normal-run evidence: {exc}")
     env["CLAUDEX_ADAPTER_EVIDENCE_DIR"] = str(evidence)
-    (evidence / "preflight.json").write_text(json.dumps(preflight, indent=2, sort_keys=True) + "\n")
 
     runtime_plan = repo / "PLAN.md"
     external_plan = plan != runtime_plan.resolve(strict=False)

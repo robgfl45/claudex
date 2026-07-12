@@ -41,6 +41,8 @@ For the standard 3,600-second adapter run, keep the outer child at least 4,200 s
 
 ## `delegate_task` template
 
+The leaf's preflight is authoritative because it runs under the same `HOME`, `PATH`, CLI authentication context, plugin discovery candidates, and output-parent permissions as the long review. Main Drake may run an advisory preflight to diagnose setup, but must not treat that as permission to skip the leaf preflight.
+
 Use a self-contained prompt equivalent to:
 
 > You are a leaf execution subagent. Do not ask Rob questions and do not delegate. First run the complete adapter command with `--preflight-only`; proceed only when it returns `preflight_ok`. Then run exactly one bounded sweep-v2 adapter operation and return exact JSON and absolute artifact paths. Repository: `<REPO>`. Existing plan: `<PLAN>`. Grounded topic: `<TOPIC>`. Risk tier: `<RISK_TIER>`. Generation cap: `<ROUNDS>`. Adapter: `<ADAPTER>`. Claude: `<CLAUDE>`. Codex: `<CODEX>`. Evidence: `<EVIDENCE>`. Run: `<ADAPTER> --repo <REPO> --plan <PLAN> --topic <TOPIC> --engine sweep-v2 --rounds <ROUNDS> --timeout 3600 --budget-usd 10 --claude <CLAUDE> --codex <CODEX> --output-dir <EVIDENCE>`. Normally omit `--plugin-root` with the checkout adapter; add it only to pin a deliberately reviewed different plugin. Preserve stdout exactly. A nonzero exit is an outcome, not permission to improvise or restart. Do not implement, commit, push, install, or change global configuration. Verify result, plan, state, manifests, all persona artifacts, and process cleanup before returning.

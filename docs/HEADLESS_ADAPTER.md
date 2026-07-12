@@ -52,6 +52,8 @@ Only `outcome=converged` with `clean=true` is a success gate. Generation five ma
 
 ## Machine-readable evidence
 
+Every normal run writes `<evidence>/preflight.json` before provider launch. The stable object records `plugin_root`, `plugin_source`, the ordered `plugin_candidates` diagnostics, `pinned_path`, nearest writable `output_parent`, `engine`, `rounds`, and structured `claude_version`, `codex_version`, `claude_auth`, and `codex_auth` probe diagnostics (`path`, `returncode`, `stdout`, and `stderr`). If a version/auth probe fails, the requested evidence directory and this available diagnostic record are retained and returned as `evidence_dir`, but no review state or provider review is created. `--preflight-only` returns the same information under `preflight` on stdout without creating evidence or state.
+
 Sweep-v2 results expose:
 
 - `engine`, `generation`, and `max_generations` (legacy-only `round`/`max_rounds` remain for compatibility);
