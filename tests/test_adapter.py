@@ -97,6 +97,14 @@ elif outcome.startswith('review_v3_'):
     consolidated=generation_dir/'consolidated-findings.md'; consolidated.write_text('\n'.join(out).rstrip()+'\n')
     material=bool(findings); now='2099-01-01T00:00:00Z'
     state_path.write_text(f'''mode: plan\nphase: done\ntopic: "{topic}"\nround: 1\nmax_rounds: 1\nfrom_draft: true\ninterview_used: false\nreview_id: {rid}\nrepo_root: {repo}\nsession_id: fake\nstarted_at: {now}\nstarted_at_epoch: 4070908800\nlast_updated_at: {now}\ndecision_signal: {'findings-returned' if material else 'converged'}\nengine: review-v3\ngeneration: 1\nmax_generations: 1\nsnapshot_sha256: {snapshot_hash}\ncoverage_complete: true\nclean: {str(not material).lower()}\nrevision_required: false\nregistry_sha256: {hashlib.sha256(registry_path.read_bytes()).hexdigest()}\nconsolidated_sha256: {hashlib.sha256(consolidated.read_bytes()).hexdigest()}\nreviewed_live_sha256: {snapshot_hash}\n''')
+    if outcome == 'review_v3_tamper_raw': (generation_dir/f'{personas[0]}.raw.json').write_text('{}\n')
+    elif outcome == 'review_v3_tamper_sidecar': (generation_dir/f'{personas[0]}.result.json').write_text('{}\n')
+    elif outcome == 'review_v3_tamper_manifest': (generation_dir/'manifest.json').write_text('{}\n')
+    elif outcome == 'review_v3_tamper_registry': registry_path.write_text('{}\n')
+    elif outcome == 'review_v3_tamper_consolidated': consolidated.write_text('tampered\n')
+    elif outcome == 'review_v3_tamper_state_digest': state_path.write_text(state_path.read_text().replace('registry_sha256: ', 'registry_sha256: 0'))
+    elif outcome == 'review_v3_tamper_state_identity': state_path.write_text(state_path.read_text().replace(f'review_id: {rid}', 'review_id: 20990101-000000-deadbe'))
+    elif outcome == 'review_v3_tamper_state_verdict': state_path.write_text(state_path.read_text().replace('clean: true', 'clean: false'))
 else:
     personas = ['architecture-scope','security-data','product-domain','quality-accessibility-performance','operations-deployment']
     match = re.search(r'--rounds (\d+)', prompt)
@@ -773,6 +781,20 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'total_cost_usd': 0.01
         self.assertEqual((completed.returncode, result["outcome"]), (0, "converged"))
         self.assertEqual(self.plan.read_text(), original)
         self.assertEqual(external.read_text(), "# External review-v3 plan\n")
+
+    def test_review_v3_copied_evidence_tamper_degrades(self):
+        fixtures = (
+            "review_v3_tamper_raw", "review_v3_tamper_sidecar", "review_v3_tamper_manifest",
+            "review_v3_tamper_registry", "review_v3_tamper_consolidated",
+            "review_v3_tamper_state_digest", "review_v3_tamper_state_identity",
+            "review_v3_tamper_state_verdict",
+        )
+        for fixture in fixtures:
+            with self.subTest(fixture=fixture):
+                completed, result = self.run_adapter(fixture, engine="review-v3")
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertFalse(result.get("clean", False))
+                self.assertIn(result["outcome"], ("degraded", "failed"))
 
     def test_sweep_generation_cap_is_rejected_before_launch(self):
         completed, result = self.run_adapter(rounds="6")

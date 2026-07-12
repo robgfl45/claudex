@@ -774,7 +774,7 @@ def validate_review_v3(state_file: Path, review_dir: Path, source_review_dir: Pa
     if contract is not None:
         try:
             manifest_path = generation_dir / "manifest.json"
-            manifest_obj = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest_obj = contract.load_bounded_json(manifest_path)
             contract.validate_manifest(manifest_obj, state_file.stem, snapshot, topic, str(runtime_plan.parent), str(runtime_plan))
             if manifest_path.read_bytes() != contract.canonical(manifest_obj).encode("utf-8"):
                 raise ValueError("manifest JSON is not canonical")
@@ -789,7 +789,7 @@ def validate_review_v3(state_file: Path, review_dir: Path, source_review_dir: Pa
                 raw_path = generation_dir / f"{persona}.raw.json"
                 sidecar_path = generation_dir / f"{persona}.result.json"
                 raw_obj = contract.load_raw(raw_path, persona, snapshot)
-                sidecar_obj = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                sidecar_obj = contract.load_bounded_json(sidecar_path)
                 contract.validate_sidecar(sidecar_obj, persona, snapshot, sha256_file(raw_path))
                 if sidecar_path.read_bytes() != contract.canonical(sidecar_obj).encode("utf-8"):
                     raise ValueError("sidecar JSON is not canonical")
@@ -805,7 +805,7 @@ def validate_review_v3(state_file: Path, review_dir: Path, source_review_dir: Pa
             coverage.append({"persona_id": persona, "snapshot_sha256": snapshot if valid else None, "valid": valid, "classification": classification})
         try:
             expected_registry = contract.registry(state_file.stem, snapshot, topic, str(runtime_plan.parent), str(runtime_plan), raws)
-            registry_obj = json.loads(registry_path.read_text(encoding="utf-8"))
+            registry_obj = contract.load_bounded_json(registry_path)
             contract.validate_registry(registry_obj, expected_registry)
             expected_registry_bytes = contract.canonical(expected_registry).encode("utf-8")
             if registry_path.read_bytes() != expected_registry_bytes:

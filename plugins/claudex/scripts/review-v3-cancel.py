@@ -9,7 +9,10 @@ def atomic(path,text):
 def main():
  p=argparse.ArgumentParser(); p.add_argument('state',type=pathlib.Path); p.add_argument('marker',type=pathlib.Path); a=p.parse_args(); lock=a.state.with_name(a.state.name+'.write-lock')
  with lock.open('a+') as held:
-  fcntl.flock(held,fcntl.LOCK_EX); lines=a.state.read_text().splitlines(); out=[]
+  fcntl.flock(held,fcntl.LOCK_EX); lines=a.state.read_text().splitlines()
+  phase=next((line.split(':',1)[1].strip() for line in lines if line.split(':',1)[0]=='phase'),None)
+  if phase != 'reviewing': return
+  out=[]
   for line in lines:
    k=line.split(':',1)[0]; replacements={'phase':'cancelled','decision_signal':'cancelled','clean':'false','coverage_complete':'false','revision_required':'false'}
    out.append(f'{k}: {replacements[k]}' if k in replacements else line)

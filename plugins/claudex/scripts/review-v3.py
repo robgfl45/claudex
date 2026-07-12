@@ -88,7 +88,10 @@ def main():
     if parse_state(state).get('phase')!='reviewing': raise ValueError('review cancelled before spawn')
     proc=subprocess.Popen([a.codex,'exec','--sandbox','read-only','--ephemeral','--ignore-rules','--output-schema',str(schema),'--output-last-message',str(raw),'-'],stdin=inp,cwd=repo,start_new_session=True)
     hook=os.environ.get('CLAUDEX_REVIEW_V3_SPAWN_HOOK')
-    if hook: pathlib.Path(hook+'.ready').write_text(str(proc.pid)); pathlib.Path(hook+'.release').read_text()
+    if hook:
+     ready=pathlib.Path(hook+'.ready'); release=pathlib.Path(hook+'.release'); ready.write_text(str(proc.pid)); deadline=time.monotonic()+10
+     while not release.exists() and time.monotonic()<deadline: time.sleep(.01)
+     if not release.exists(): kill_group(proc); raise TimeoutError('spawn synchronization release timed out')
     atomic(marker,str(proc.pid)+"\n")
     if parse_state(state).get('phase')!='reviewing': kill_group(proc); raise ValueError('review cancelled during spawn')
    try: rc=proc.wait(timeout=a.timeout)
@@ -101,7 +104,7 @@ def main():
    if repo_snapshot(repo,state.parent)!=baseline_repo: raise ValueError('repository byte/mode/symlink mutation detected')
    if sha(state)!=baseline_state: raise ValueError('state mutation detected')
    if evidence_snapshot(review,excluded)!=baseline_evidence: raise ValueError('protected evidence mutation detected')
-   obj=json.loads(raw.read_bytes().decode()); atomic(raw,canonical(obj)); obj=load_raw(raw,persona,snapshot); raws.append(obj)
+   obj=load_bounded_json(raw); atomic(raw,canonical(obj)); obj=load_raw(raw,persona,snapshot); raws.append(obj)
   except Exception as exc: error=str(exc)
   finally: prompt.unlink(missing_ok=True)
   side_obj={"schema_version":1,"generation":1,"persona_id":persona,"snapshot_sha256":snapshot,"raw_sha256":sha(raw) if raw.is_file() else None,"codex_exit_code":rc,"valid":error is None,"error":error,"completed_at":dt.datetime.now(dt.timezone.utc).isoformat().replace('+00:00','Z')}; atomic(side,canonical(side_obj))
