@@ -1,0 +1,29 @@
+{
+  "outcome": "accepted_after_targeted_closure",
+  "verifications": [
+    {
+      "evidence": [
+        "offline transcript evidence"
+      ],
+      "finding_id": "CX-0001",
+      "reason": "fixture",
+      "verdict": "closed"
+    },
+    {
+      "evidence": [
+        "offline transcript evidence"
+      ],
+      "finding_id": "CX-0002",
+      "reason": "fixture",
+      "verdict": "closed"
+    },
+    {
+      "evidence": [
+        "offline transcript evidence"
+      ],
+      "finding_id": "CX-0003",
+      "reason": "fixture",
+      "verdict": "closed"
+    }
+  ]
+}

@@ -1,40 +1,35 @@
 ---
 name: project-plan-review
 description: Use for substantial implementation plans that benefit from independent Claude/Claudex/Codex adversarial review. Skip tiny, obvious fixes.
-version: 2.1.0
+version: 3.0.0
 license: MIT
 metadata:
   hermes:
-    tags: [planning, claudex, codex, delegation, verification, sweep-v2]
+    tags: [planning, claudex, codex, delegation, verification, review-v3, targeted-closure]
 ---
 
 # Project Plan Review
 
 Use this workflow for substantial features, migrations, or risky cross-cutting work. **Do not use it for tiny fixes** where review overhead exceeds implementation risk.
 
-## Proportional review depth
+## Staged review-v3 workflow
 
-Choose and record the risk tier **before** launching the adapter. Do not increase the cap merely because a reviewer can suggest further hardening.
+Routine/reversible fixes normally skip Claudex. Every substantial, cross-cutting, security, privacy, migration, or operations-critical project plan uses exactly one frozen broad pass: `--engine review-v3 --rounds 1`. All five personas review one immutable hash without editing it. Drake adjudicates the stable registry, applies bounded corrections, then runs the targeted-closure CLI.
 
-- **Routine/reversible:** normally skip Claudex; use one generation only when independent review adds clear value.
-- **Substantial/cross-cutting:** maximum **two generations** (`--rounds 2`). This is the default project-plan-review tier.
-- **Security/privacy/migration/operations-critical:** maximum **three generations** (`--rounds 3`).
-- **Exceptional five-generation sweep:** only with Rob's explicit approval for a specific plan. It is not the default and is never an automatic response to findings at the normal cap.
-
-Every generation still uses all five personas against one immutable snapshot. The cap limits repeated revision cycles; it does not weaken same-hash coverage or evidence validation.
+`sweep-v2` remains supported as an explicitly selected rollback/exceptional legacy path. It is not the automatic next step after findings. Do not install this staged skill into active Hermes until the repository change is merged and merged-head live proof plus separate operator approval succeeds.
 
 ## Main Drake workflow
 
 1. Ground the project first: inspect the repository, current behavior, constraints, tests, and user request. Never ask a leaf reviewer to invent this context.
 2. Draft a concrete `PLAN.md` in the project root. Include scope/non-scope, exact files, existing contracts, steps, rollback, and verification.
-3. Select the risk tier and generation cap using the rules above, then read [the delegation runbook](references/runbook.md).
+3. Select review-v3 for every substantial plan, then read [the delegation runbook](references/runbook.md).
 4. Call `delegate_task` with self-contained context and absolute paths for the repository, `PLAN.md`, adapter, Claude, Codex, and a new evidence directory. The child is a leaf: it cannot ask Rob questions or delegate further. The **leaf owns the authoritative preflight** because it must validate the same `HOME`, `PATH`, CLI authentication context, plugin candidates, and output parent used by the long run. A parent-session preflight may be used only as an advisory setup check and never substitutes for the leaf preflight.
-5. In that leaf, run the complete adapter command once with `--preflight-only`; proceed only on `preflight_ok`, then rerun the same command without `--preflight-only` for the bounded `sweep-v2` review. With the checkout adapter, normally omit `--plugin-root`; pin it only for a deliberately reviewed different plugin. The review command must invoke `/claudex:plan --engine sweep-v2 --from-draft --skip-interview --rounds <CAP> ...` through the adapter.
+5. In that leaf, run the complete adapter command once with `--preflight-only`; proceed only on `preflight_ok`, then rerun the identical command without `--preflight-only` using `--engine review-v3 --rounds 1`. With the checkout adapter, normally omit `--plugin-root`; pin it only for a deliberately reviewed different plugin.
 6. Keep the main Drake session responsive while the child performs the bounded run. Standard runs use a 3,600-second adapter timeout and an outer child timeout of at least 4,200 seconds. For any non-standard timeout, the outer child must exceed the adapter by at least 300 seconds for artifact read-back and reporting.
 7. On return, read `result.json`, copied state, generation manifest, consolidated findings, and all five persona sidecars/findings. A claimed path is not evidence until read.
 8. Independently apply the materiality rubric below. Claudex is a critic, not the product owner.
-9. If the adapter converged, normalize only non-material wording/formatting and verify the final hash. Material normalization invalidates convergence and requires an explicit bounded review decision.
-10. If the cap is reached with findings, stop the generic sweep and use [targeted closure](references/targeted-closure.md). Do not automatically start another full sweep.
+9. If review-v3 converged cleanly, preserve the reviewed hash. If it returned findings, Drake dispositions every exact registry ID, edits a separate final plan narrowly, and uses [targeted closure](references/targeted-closure.md).
+10. Permit one closure pass and at most one attempt-2 recheck of only prior `not_closed` IDs. Architecture/scope change requires a new full review-v3; never start another generic pass automatically.
 11. Deliver the plan with exact outcome language, hashes, findings dispositions, unresolved risks, and evidence paths.
 
 ## Materiality rubric

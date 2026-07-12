@@ -1,0 +1,13 @@
+{
+  "outcome": "closure_requires_new_review",
+  "verifications": [
+    {
+      "evidence": [
+        "offline transcript evidence"
+      ],
+      "finding_id": "CX-0001",
+      "reason": "fixture",
+      "verdict": "closure_requires_new_review"
+    }
+  ]
+}

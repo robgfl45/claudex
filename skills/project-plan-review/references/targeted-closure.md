@@ -1,99 +1,92 @@
-# Targeted closure after the generation cap
+# Drake-owned targeted closure after review-v3
 
-Use this workflow when the configured proportional cap completes with material findings. It replaces an automatic unrestricted rerun; it does not weaken the adapter's mechanical convergence contract.
+Use this bounded workflow after one complete `review-v3 --rounds 1` pass returns `findings_returned`. It never changes the mechanical review result and never calls closure `converged`.
 
-## Preconditions
+## Preconditions and exact sequence
 
-- The cap was selected before launch: normally two generations for substantial work, three for security/privacy/migration/operations-critical work, or five only with Rob's explicit approval for that exact plan.
-- The terminal generation has readable, valid five-persona same-hash evidence.
-- The adapter outcome and any live-plan/snapshot mismatch are understood.
-- No owned adapter, Claude, Codex, or reviewer process remains.
+The authoritative leaf first runs the plan adapter's complete command with `--preflight-only`, then the identical command without that flag:
 
-If terminal evidence is malformed, incomplete, or untrusted, targeted closure cannot repair it. Classify the run as degraded and fix the evidence/process defect first.
-
-## 1. Freeze the closure inputs
-
-Record:
-
-- review ID and configured cap;
-- terminal adapter outcome;
-- terminal reviewed snapshot path and SHA-256;
-- live plan path and SHA-256;
-- terminal consolidated findings path and digest; and
-- exact cap-round persona artifacts.
-
-Never imply that a post-cap live-plan edit was persona-reviewed.
-
-## 2. Disposition every cap-round finding
-
-Create a table with one row per finding:
-
-| Finding ID | Severity | Material? | Repository/requirement grounding | Disposition | Verification |
-|---|---|---|---|---|---|
-
-Allowed dispositions:
-
-- `accept-and-correct`: clears the materiality rubric and requires a plan correction;
-- `already-satisfied`: the frozen or final plan already contains an enforceable answer; cite it;
-- `defer-to-implementation`: safely resolvable during coding without changing architecture, safety boundaries, or release gates;
-- `reject-scope-creep`: optional hardening, alternate design, unsupported enterprise machinery, or stylistic preference;
-- `accept-risk`: only with Rob's explicit decision when a real material risk remains.
-
-Do not revise the plan for rejected/deferred findings merely to make the reviewer quiet.
-
-## 3. Apply narrow corrections
-
-For each `accept-and-correct` item:
-
-- edit only the contracts, steps, rollback, or verification needed to close that finding;
-- avoid introducing a new subsystem when a repository-native mechanism suffices;
-- preserve user scope and non-scope;
-- record the exact section changed; and
-- compute the new plan hash.
-
-If a correction changes product scope, trust boundaries, data model, migration strategy, or rollout architecture beyond the finding itself, targeted closure is insufficient. Ask Rob whether to accept the change or run a new bounded review at the appropriate tier.
-
-## 4. Targeted verification
-
-Independently verify each accepted correction against the repository and explicit requirements. Use the smallest relevant check:
-
-- inspect concrete code/API/config contracts;
-- recompute budgets or invariants with a tool;
-- verify migration/rollback ordering;
-- trace security/data boundaries;
-- confirm test/release gates are executable and bounded; or
-- use one relevant specialist review when domain expertise is genuinely needed.
-
-Do **not** rerun all five personas automatically. Do not ask an unrestricted reviewer to find anything else wrong. The verification question is only: "Does this exact correction close finding X without introducing a contradictory material risk?"
-
-## 5. Readiness decision
-
-`accepted_after_targeted_closure` is allowed only when:
-
-- all cap-round findings have dispositions;
-- every accepted material correction passed targeted verification;
-- no unresolved high/medium safety, correctness, data-integrity, rollback, or implementability risk remains;
-- final scope is proportionate and repository-grounded; and
-- final plan hash and verification evidence are recorded.
-
-Report both truths:
-
-```text
-adapter_outcome: max_reached|degraded
-adapter_converged: false
-plan_readiness: accepted_after_targeted_closure
+```bash
+/path/to/claudex/bin/claudex-plan-review \
+  --repo /absolute/project --plan /absolute/project/PLAN.md \
+  --topic "exact grounded topic" --engine review-v3 --rounds 1 \
+  --timeout 3600 --budget-usd 10.00 \
+  --claude /absolute/claude --codex /absolute/codex \
+  --output-dir /absolute/new/review-evidence [--preflight-only]
 ```
 
-If any material blocker remains, readiness is `blocked`; do not soften it because the cap was reached.
+Read the copied registry, original frozen plan, and result. Drake—not a model—dispositions every stable registry ID, narrowly corrects a separate final plan, then writes strict canonical JSON (`indent=2`, sorted keys, UTF-8, trailing newline).
 
-## 6. Delivery record
+## Closure manifest schema
 
-Deliver:
+```json
+{
+  "attempt": 1,
+  "dispositions": [{
+    "approval_reference": null,
+    "changed_sections": ["Safety / lock ordering"],
+    "disposition": "accept-and-correct",
+    "finding_id": "CX-0001",
+    "non_plan_blocking_justification": null,
+    "rationale": "The final plan now specifies one repository-native lock order."
+  }],
+  "engine": "review-v3",
+  "final_plan_sha256": "<64 lowercase hex>",
+  "original_snapshot_sha256": "<64 lowercase hex>",
+  "prior_result_sha256": null,
+  "prior_terminal_manifest_sha256": null,
+  "registry_sha256": "<64 lowercase hex>",
+  "repo_root": "/canonical/project",
+  "review_id": "<exact registry review ID>",
+  "schema_version": 1,
+  "topic": "<exact registry topic>"
+}
+```
 
-- final `PLAN.md`;
-- reviewed snapshot and final hashes;
-- adapter outcome and cap;
-- findings disposition table;
-- targeted verification evidence;
-- explicitly accepted/deferred risks; and
-- statement that no further generic sweep was run.
+Every registry ID appears exactly once; unknown, duplicate, and missing IDs fail closed. Allowed dispositions are `accept-and-correct`, `already-satisfied`, `defer-to-implementation`, `reject-scope-creep`, and `accept-risk`. Corrections require bounded non-empty `changed_sections`. Parent-owned rows normally keep it empty. `accept-risk` requires a non-empty explicit Rob approval reference. A high/medium defer requires `non_plan_blocking_justification` explaining why it is not a plan blocker and must never hide safety/correctness risk.
+
+## Run
+
+```bash
+/path/to/claudex/bin/claudex-plan-closure \
+  --repo /absolute/project \
+  --original-plan /absolute/review-evidence/artifacts/review/generations/1/PLAN.md \
+  --final-plan /absolute/project/PLAN.final.md \
+  --registry /absolute/review-evidence/artifacts/review/generations/1/findings-registry.json \
+  --manifest /absolute/closure-manifest.json \
+  --codex /absolute/codex --timeout 600 \
+  --output-dir /absolute/new/closure-evidence
+```
+
+Only `accept-and-correct` and `already-satisfied` rows launch Codex. Each read-only, ephemeral, ignore-rules verifier receives only the exact finding, original and final plans, changed sections, disposition/rationale, and repository context. It cannot create findings, edit plans, or decide ownership/risk acceptance.
+
+A single narrow recheck is allowed only for genuine, fully validated attempt-1 `not_closed` IDs. Preserve the attempt-1 stdout `terminal_manifest_sha256` trust anchor. Create a new evidence directory and an attempt-2 manifest containing exactly those rows, binding both `prior_result_sha256` and `prior_terminal_manifest_sha256`, then add:
+
+```bash
+--prior-evidence-dir /absolute/attempt-1/evidence \
+--prior-terminal-manifest-sha256 <preserved-stdout-digest>
+```
+
+Independently verify any terminal evidence read-only with:
+
+```bash
+/path/to/claudex/bin/claudex-plan-closure \
+  --verify-evidence /absolute/closure-evidence \
+  --expected-terminal-sha256 <preserved-stdout-digest>
+```
+
+No third attempt exists. `closure_requires_new_review` cannot be rechecked; run a new full review-v3 against the changed architecture/scope contract.
+
+## Outcomes and evidence
+
+- `accepted_after_targeted_closure` (0): all IDs dispositioned, all required verifiers closed, approvals/evidence present, and final hash unchanged.
+- `blocked` (10): a targeted correction remains `not_closed` or readiness evidence is insufficient.
+- `closure_requires_new_review` (10): a correction directly changes/contradicts architecture or scope contract.
+- `degraded` (11): malformed, oversized, missing, identity-mismatched, mutated, incomplete, nonzero, or tampered evidence/process.
+- `timed_out` (124): adapter wall clock/cancellation; descendants are terminated and reaped.
+
+Stdout is exactly one JSON object and always records `adapter_converged: false`; successful finalization adds the externally preservable `terminal_manifest_sha256`. The canonical terminal manifest binds every final evidence file by relative path, byte size, and SHA-256 plus result digest and review identity. Registry IDs are immutable and never renumbered. A `closed` verdict requires non-empty evidence. Parent dispositions remain visible and are not model-overruled. No generic sweep follows automatically.
+
+## Staged rollout and rollback
+
+The repository skill switches to review-v3 plus closure only in this checkout. Installing/switching the active Hermes skill occurs **only after merged-head live proof and separate operator approval**. Do not modify `~/.hermes`. `sweep-v2` remains documented and supported as the exceptional rollback/legacy path.

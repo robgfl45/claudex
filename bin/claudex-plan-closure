@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Bounded Drake-owned targeted verification with anchored terminal evidence."""
+from __future__ import annotations
+import argparse,datetime as dt,importlib.util,json,os,pathlib,shutil,signal,stat,subprocess,sys,tempfile,time
+ROOT=pathlib.Path(__file__).resolve().parents[1]; spec=importlib.util.spec_from_file_location("closure_contract",ROOT/"plugins/claudex/scripts/closure_contract.py"); c=importlib.util.module_from_spec(spec); spec.loader.exec_module(c)
+EXIT={"accepted_after_targeted_closure":0,"blocked":10,"closure_requires_new_review":10,"degraded":11,"timed_out":124}; ACTIVE=None; INTERRUPTED=False; EMITTED=False
+def emit(obj,code):
+ global EMITTED
+ if not EMITTED: print(json.dumps(obj,sort_keys=True,separators=(",",":"),ensure_ascii=False)); EMITTED=True
+ return code
+def atom(path,data):
+ path.parent.mkdir(parents=True,exist_ok=True); fd,tmp=tempfile.mkstemp(prefix=path.name+".tmp.",dir=path.parent)
+ try:
+  with os.fdopen(fd,"wb") as f: f.write(data); f.flush(); os.fsync(f.fileno())
+  os.replace(tmp,path)
+ finally:
+  try: os.unlink(tmp)
+  except FileNotFoundError: pass
+def event(path,kind,**fields):
+ if os.environ.get("CLAUDEX_CLOSURE_FAIL_EVENT"): raise OSError("injected event write failure")
+ with path.open("a",encoding="utf-8") as f: f.write(json.dumps({"at":dt.datetime.now(dt.timezone.utc).isoformat(),"event":kind,**fields},sort_keys=True,separators=(",",":"))+"\n")
+def stop(proc):
+ if proc is None:return
+ try: os.killpg(proc.pid,signal.SIGTERM)
+ except ProcessLookupError: pass
+ try: proc.wait(timeout=.5); return
+ except subprocess.TimeoutExpired: pass
+ try: os.killpg(proc.pid,signal.SIGKILL)
+ except ProcessLookupError: pass
+ try: proc.wait(timeout=2)
+ except Exception: pass
+def on_signal(_s,_f):
+ global INTERRUPTED; INTERRUPTED=True
+def abs_file(raw,label,executable=False):
+ p=pathlib.Path(raw)
+ if not p.is_absolute(): raise ValueError(f"{label} must be absolute")
+ p=p.resolve(strict=True)
+ if not p.is_file() or p.stat().st_size==0 or (executable and not os.access(p,os.X_OK)): raise ValueError(f"{label} invalid")
+ return p
+def abs_dir(raw,label):
+ p=pathlib.Path(raw)
+ if not p.is_absolute(): raise ValueError(f"{label} must be absolute")
+ p=p.resolve(strict=True)
+ if not p.is_dir(): raise ValueError(f"{label} invalid")
+ return p
+def repo_state(repo,excluded):
+ out={}; excluded=pathlib.Path(os.path.abspath(excluded))
+ for base,dirs,files in os.walk(repo,topdown=True,followlinks=False):
+  bp=pathlib.Path(base); dirs[:]=[d for d in dirs if (bp/d)!=excluded and excluded not in (bp/d).parents]
+  for name in sorted(files+dirs):
+   p=bp/name
+   if p==excluded or excluded in p.parents: continue
+   try: st=os.lstat(p)
+   except FileNotFoundError: continue
+   mode=stat.S_IMODE(st.st_mode); rel=str(p.relative_to(repo))
+   if stat.S_ISLNK(st.st_mode): out[rel]=("link",mode,os.readlink(p))
+   elif stat.S_ISREG(st.st_mode): out[rel]=("file",mode,c.sha(p))
+   elif stat.S_ISDIR(st.st_mode): out[rel]=("dir",mode)
+ return out
+def terminal_entries(root):
+ rows=[]
+ for p in sorted(root.rglob("*")):
+  if p.name=="terminal-manifest.json" or not p.is_file(): continue
+  rows.append({"path":str(p.relative_to(root)),"bytes":p.stat().st_size,"sha256":c.sha(p)})
+ return rows
+def verifier_schema():
+ return {"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":False,"required":["finding_id","verdict","evidence","reason"],"properties":{"finding_id":{"type":"string","pattern":"^CX-[0-9]{4}$"},"verdict":{"enum":["closed","not_closed","closure_requires_new_review"]},"evidence":{"type":"array","minItems":1,"maxItems":50,"items":{"type":"string","minLength":1,"maxLength":8000}},"reason":{"type":"string","minLength":1,"maxLength":8000}}}
+def verify_evidence(root,expected):
+ root=abs_dir(str(root),"evidence dir"); tm=root/"terminal-manifest.json"
+ if c.sha(tm)!=expected: raise ValueError("terminal manifest trust anchor mismatch")
+ man=c.load_json(tm); keys={"schema_version","engine","review_id","topic","repo_root","attempt","result_sha256","files"}
+ if not isinstance(man,dict) or set(man)!=keys or man["schema_version"]!=1 or man["engine"]!="review-v3": raise ValueError("terminal manifest schema mismatch")
+ if man["files"]!=terminal_entries(root): raise ValueError("terminal evidence file set/digest/size mismatch")
+ result=c.load_json(root/"result.json")
+ if c.sha(root/"result.json")!=man["result_sha256"]: raise ValueError("terminal result digest mismatch")
+ for k in ("engine","review_id","topic","repo_root","attempt"):
+  if result[k]!=man[k]: raise ValueError("terminal result identity mismatch")
+ return result
+def validate_prior(result,reg,man,prior_sha):
+ base={"schema_version","engine","review_id","topic","attempt","outcome","clean","adapter_converged","repo_root","original_snapshot_sha256","final_plan_sha256","registry_sha256","manifest_sha256","prior_result_sha256","prior_terminal_manifest_sha256","dispositions","verifications","processes","elapsed_seconds","evidence_dir"}
+ if not isinstance(result,dict) or set(result)!=base or result["schema_version"]!=1 or result["engine"]!="review-v3" or result["attempt"]!=1: raise ValueError("prior result exact schema/attempt mismatch")
+ identity={"review_id":reg["review_id"],"topic":reg["topic"],"repo_root":reg["repo_root"],"original_snapshot_sha256":reg["snapshot_sha256"],"final_plan_sha256":man["final_plan_sha256"],"registry_sha256":man["registry_sha256"],"manifest_sha256":prior_sha,"prior_result_sha256":None,"prior_terminal_manifest_sha256":None}
+ for k,v in identity.items():
+  if result[k]!=v: raise ValueError(f"prior result {k} mismatch")
+ if result["dispositions"]!=man["dispositions"]: raise ValueError("prior dispositions do not exactly match manifest")
+ verify_rows=[x for x in man["dispositions"] if x["disposition"] in c.VERIFY_DISPOSITIONS]; expected=[x["finding_id"] for x in verify_rows]
+ if not isinstance(result["verifications"],list) or [x.get("finding_id") for x in result["verifications"]]!=expected: raise ValueError("prior verifier rows incomplete, duplicate, or out of order")
+ for x,fid in zip(result["verifications"],expected): c.validate_verifier(x,fid)
+ if not isinstance(result["processes"],list) or [x.get("finding_id") for x in result["processes"]]!=expected: raise ValueError("prior process rows incomplete, duplicate, or out of order")
+ for p in result["processes"]:
+  if set(p)!={"finding_id","pid","exit_code","timed_out"} or not isinstance(p["pid"],int) or p["exit_code"]!=0 or p["timed_out"] is not False: raise ValueError("prior process row invalid")
+ verdicts=[x["verdict"] for x in result["verifications"]]; outcome="closure_requires_new_review" if "closure_requires_new_review" in verdicts else ("blocked" if "not_closed" in verdicts else "accepted_after_targeted_closure")
+ if result["outcome"]!=outcome or result["clean"]!=(outcome=="accepted_after_targeted_closure") or result["adapter_converged"] is not False: raise ValueError("prior outcome is dishonest")
+ if outcome!="blocked": raise ValueError("prior evidence is not eligible for recheck")
+ return {x["finding_id"] for x in result["verifications"] if x["verdict"]=="not_closed"}
+def parser():
+ p=argparse.ArgumentParser(); p.add_argument("--verify-evidence"); p.add_argument("--expected-terminal-sha256");
+ for x in ("repo","original-plan","final-plan","registry","manifest","codex","output-dir"): p.add_argument("--"+x)
+ p.add_argument("--timeout",type=float,default=600); p.add_argument("--prior-evidence-dir"); p.add_argument("--prior-terminal-manifest-sha256"); return p
+def main():
+ global ACTIVE
+ output=None; started=time.monotonic(); reg=man=None; result=None
+ try:
+  a=parser().parse_args()
+  if a.verify_evidence:
+   if not a.expected_terminal_sha256 or any(getattr(a,x.replace('-','_')) for x in ("repo","original-plan","final-plan","registry","manifest","codex","output-dir")): raise ValueError("verify mode requires only evidence dir and expected digest")
+   verified=verify_evidence(pathlib.Path(a.verify_evidence),a.expected_terminal_sha256); return emit({"schema_version":1,"verified":True,"terminal_manifest_sha256":a.expected_terminal_sha256,"outcome":verified["outcome"]},0)
+  required=(a.repo,a.original_plan,a.final_plan,a.registry,a.manifest,a.codex,a.output_dir)
+  if not all(required): raise ValueError("all run-mode arguments are required")
+  repo=abs_dir(a.repo,"repo"); original=abs_file(a.original_plan,"original plan"); final=abs_file(a.final_plan,"final plan"); registry_path=abs_file(a.registry,"registry"); manifest_path=abs_file(a.manifest,"manifest"); codex=abs_file(a.codex,"codex",True)
+  if subprocess.run(["git","rev-parse","--is-inside-work-tree"],cwd=repo,capture_output=True,text=True).stdout.strip()!="true": raise ValueError("repo must be a trusted git worktree")
+  output=pathlib.Path(a.output_dir)
+  if not output.is_absolute() or output.exists() or not output.parent.resolve(strict=True).is_dir(): raise ValueError("output dir must be absolute, new, and have an existing parent")
+  if a.timeout<=0: raise ValueError("timeout must be positive")
+  original_sha=c.sha(original); final_sha=c.sha(final); registry_sha=c.sha(registry_path); reg=c.load_json(registry_path); c.validate_registry(reg,repo_root=str(repo),original_sha=original_sha)
+  prior_sha=prior_terminal=None; recheck_ids=None
+  if bool(a.prior_evidence_dir)!=bool(a.prior_terminal_manifest_sha256): raise ValueError("prior evidence dir and terminal anchor are jointly required")
+  if a.prior_evidence_dir:
+   prior=verify_evidence(pathlib.Path(a.prior_evidence_dir),a.prior_terminal_manifest_sha256); prior_sha=c.sha(pathlib.Path(a.prior_evidence_dir)/"result.json"); prior_terminal=a.prior_terminal_manifest_sha256
+  man=c.load_json(manifest_path)
+  if a.prior_evidence_dir:
+   prior_man=c.load_json(pathlib.Path(a.prior_evidence_dir)/"artifacts/closure-manifest.json"); recheck_ids=validate_prior(prior,reg,prior_man,c.sha(pathlib.Path(a.prior_evidence_dir)/"artifacts/closure-manifest.json"))
+  rows=c.validate_manifest(man,reg,repo_root=str(repo),original_sha=original_sha,final_sha=final_sha,registry_sha=registry_sha,prior_result_sha=prior_sha,prior_terminal_sha=prior_terminal,recheck_ids=recheck_ids)
+  output.mkdir(mode=0o700); events=output/"events.jsonl"; artifacts=output/"artifacts"; artifacts.mkdir(); rawdir=output/"verifiers"; rawdir.mkdir()
+  copies={"registry.json":registry_path,"original-plan.md":original,"final-plan.md":final,"closure-manifest.json":manifest_path}
+  if os.environ.get("CLAUDEX_CLOSURE_FAIL_COPY"): raise OSError("injected copy failure")
+  for name,src in copies.items(): shutil.copyfile(src,artifacts/name)
+  schema=output/"closure-output.schema.json"; atom(schema,c.canonical(verifier_schema()).encode()); baseline=repo_state(repo,output); deadline=started+a.timeout; verifications=[]; process_rows=[]; outcome="accepted_after_targeted_closure"; error=None; finding_byid={x["finding_id"]:x for x in reg["findings"]}
+  signal.signal(signal.SIGTERM,on_signal); signal.signal(signal.SIGINT,on_signal)
+  for fid,row in rows.items():
+   if row["disposition"] not in c.VERIFY_DISPOSITIONS: continue
+   if INTERRUPTED or time.monotonic()>=deadline: outcome="timed_out"; error="adapter wall clock expired or was cancelled"; break
+   prompt=rawdir/f"{fid}.prompt.txt"; raw=rawdir/f"{fid}.raw.json"; context={"finding":finding_byid[fid],"original_frozen_plan":(artifacts/"original-plan.md").read_text(),"final_plan":(artifacts/"final-plan.md").read_text(),"changed_sections":row["changed_sections"],"disposition":row["disposition"],"rationale":row["rationale"],"repository_context":{"repo_root":str(repo),"topic":reg["topic"]}}
+   atom(prompt,("You are a targeted closure verifier. Check only the exact finding below. Do not perform generic review, propose new findings or IDs, edit the plan, or decide product ownership/risk acceptance. Return only schema JSON.\n"+c.canonical(context)).encode()); event(events,"verifier_start",finding_id=fid); before=repo_state(repo,output)
+   with prompt.open("rb") as inp: ACTIVE=subprocess.Popen([str(codex),"exec","--sandbox","read-only","--ephemeral","--ignore-rules","--output-schema",str(schema),"--output-last-message",str(raw),"-"],cwd=repo,stdin=inp,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+   timed=False
+   while True:
+    rc=ACTIVE.poll()
+    if rc is not None: break
+    if INTERRUPTED or time.monotonic()>=deadline: stop(ACTIVE); rc=124; timed=True; break
+    time.sleep(.025)
+   process_rows.append({"finding_id":fid,"pid":ACTIVE.pid,"exit_code":rc,"timed_out":timed}); ACTIVE=None
+   if timed: outcome="timed_out"; error=f"verifier timed out/cancelled for {fid}"; break
+   if rc!=0: outcome="degraded"; error=f"reviewer nonzero for {fid}: {rc}"; break
+   if repo_state(repo,output)!=before or repo_state(repo,output)!=baseline: raise ValueError("repository mutation detected")
+   if c.sha(final)!=final_sha: raise ValueError("final plan hash mutated")
+   obj=c.load_json(raw); c.validate_verifier(obj,fid); verifications.append(obj); event(events,"verifier_complete",finding_id=fid,verdict=obj["verdict"])
+   if obj["verdict"]=="closure_requires_new_review": outcome="closure_requires_new_review"; break
+   if obj["verdict"]=="not_closed": outcome="blocked"
+  if INTERRUPTED: outcome="timed_out"; error="adapter was cancelled"
+  if c.sha(final)!=final_sha or repo_state(repo,output)!=baseline: raise ValueError("final/repository mutation at terminal revalidation")
+  for name,digest in (("registry.json",registry_sha),("original-plan.md",original_sha),("final-plan.md",final_sha),("closure-manifest.json",c.sha(manifest_path))):
+   if c.sha(artifacts/name)!=digest: raise ValueError("copied artifact tamper detected")
+  if os.environ.get("CLAUDEX_CLOSURE_TAMPER_HOOK"): (artifacts/"registry.json").write_text("{}\n"); raise ValueError("copied artifact tamper detected")
+  result={"schema_version":1,"engine":"review-v3","review_id":reg["review_id"],"topic":reg["topic"],"attempt":man["attempt"],"outcome":outcome,"clean":outcome=="accepted_after_targeted_closure","adapter_converged":False,"repo_root":str(repo),"original_snapshot_sha256":original_sha,"final_plan_sha256":final_sha,"registry_sha256":registry_sha,"manifest_sha256":c.sha(manifest_path),"prior_result_sha256":prior_sha,"prior_terminal_manifest_sha256":prior_terminal,"dispositions":list(rows.values()),"verifications":verifications,"processes":process_rows,"elapsed_seconds":round(time.monotonic()-started,6),"evidence_dir":str(output)}
+  if error: result["error"]=error
+  atom(output/"processes.json",c.canonical(process_rows).encode())
+  if os.environ.get("CLAUDEX_CLOSURE_FAIL_RESULT"): raise OSError("injected result write failure")
+  atom(output/"result.json",c.canonical(result).encode())
+  tm={"schema_version":1,"engine":"review-v3","review_id":reg["review_id"],"topic":reg["topic"],"repo_root":str(repo),"attempt":man["attempt"],"result_sha256":c.sha(output/"result.json"),"files":terminal_entries(output)}
+  if os.environ.get("CLAUDEX_CLOSURE_FAIL_TERMINAL"): raise OSError("injected terminal manifest write failure")
+  atom(output/"terminal-manifest.json",c.canonical(tm).encode()); anchor=c.sha(output/"terminal-manifest.json"); wrapper={**result,"terminal_manifest_sha256":anchor}; return emit(wrapper,EXIT[outcome])
+ except BaseException as exc:
+  stop(ACTIVE); ACTIVE=None
+  msg=str(exc) or type(exc).__name__; degraded={"schema_version":1,"outcome":"degraded","clean":False,"adapter_converged":False,"error":msg}
+  if output is not None:
+   degraded["evidence_dir"]=str(output)
+   try:
+    output.mkdir(parents=True,exist_ok=True); atom(output/"failure.json",c.canonical(degraded).encode())
+   except Exception: pass
+  return emit(degraded,11)
+ finally: stop(ACTIVE); ACTIVE=None
+if __name__=="__main__": sys.exit(main())

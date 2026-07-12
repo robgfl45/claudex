@@ -1,0 +1,10 @@
+{
+  "findings": [
+    {
+      "finding_id": "CX-0001"
+    },
+    {
+      "finding_id": "CX-0002"
+    }
+  ]
+}

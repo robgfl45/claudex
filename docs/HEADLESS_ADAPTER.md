@@ -14,9 +14,13 @@
 
 Interactive review mode and the plugin's legacy plan mode are unchanged.
 
-## Experimental review-v3
+## Review-v3 and Drake-owned targeted closure
 
-Select `--engine review-v3 --rounds 1` for a single frozen, read-only five-persona review. It produces strict per-persona JSON, runner-owned stable `CX-NNNN` identities, `findings-registry.json`, and registry-derived `consolidated-findings.md`. It never edits `PLAN.md`, requests a revision, adjudicates findings, or accepts a proposed remedy merely because its underlying risk is accepted. Complete clean coverage is `converged` (0); complete material coverage is the distinct non-clean `findings_returned` (10). A per-persona timeout, reviewer nonzero, malformed/missing/oversized output, identity mismatch, or mutation makes review-v3 degraded/non-clean; the adapter's independent wall-clock expiration remains `timed_out` with exit 124. The frozen plan is protected by a canonical manifest plus repeated SHA-256 and byte validation—not by filesystem immutability—and repository byte/mode/symlink snapshots provide defense in depth. `--preflight-only` validates the review-v3 runner without creating state/evidence. Use `--engine sweep-v2` for rollback. Review-v3 is experimental and opt-in; `sweep-v2` remains the Hermes default, and rollout awaits the next PR and live proof.
+Select `--engine review-v3 --rounds 1` for a single frozen, read-only five-persona review. It produces strict per-persona JSON, runner-owned stable `CX-NNNN` identities, `findings-registry.json`, and registry-derived consolidation without editing `PLAN.md` or adjudicating remedies. Complete clean coverage is `converged` (0); complete material coverage is the distinct non-clean `findings_returned` (10). Malformed/missing/oversized output, nonzero, timeout, identity mismatch, or mutation fails closed.
+
+After findings, Drake dispositions every exact registry ID, narrowly edits a separate final plan, and invokes `bin/claudex-plan-closure`. The closure command verifies only `accept-and-correct` and `already-satisfied` rows in read-only/ephemeral/ignore-rules Codex sessions; every verifier verdict carries non-empty evidence, while parent-owned reject/defer/risk decisions remain visible and are never model-overruled. Outcomes are `accepted_after_targeted_closure` (0), `blocked` or `closure_requires_new_review` (10), `degraded` (11), and `timed_out` (124)—never `converged`. One normal pass plus at most one new-directory recheck of only `not_closed` IDs from strictly validated, terminal-manifest-anchored attempt-1 evidence is allowed. Use `--verify-evidence` with the preserved stdout terminal digest for read-only reconstruction. See the exact commands in `skills/project-plan-review/references/targeted-closure.md`.
+
+`sweep-v2` remains the supported rollback/exceptional legacy path. The repository skill is staged for review-v3+closure, but active Hermes installation/switch occurs only after merged-head live proof and separate operator approval.
 
 ## Exact usage
 
