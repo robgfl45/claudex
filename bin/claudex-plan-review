@@ -291,7 +291,7 @@ def validate_plugin_candidate(path: Path, engine: str) -> tuple[Path | None, lis
     if engine in {"sweep-v2", "review-v3"}:
         required += [resolved / "scripts" / "sweep-helpers.sh", resolved / "scripts" / "personas.sh"]
     if engine == "review-v3":
-        required += [resolved / "scripts" / "review-v3.py", resolved / "scripts" / "review_v3_contract.py"]
+        required += [resolved / "scripts" / "review-v3.py", resolved / "scripts" / "review-v3-setup.py", resolved / "scripts" / "review-v3-cancel.py", resolved / "scripts" / "review_v3_contract.py"]
     for item in required:
         if not item.is_file():
             errors.append(f"missing required file {item.relative_to(resolved)}")

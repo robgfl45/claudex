@@ -19,4 +19,11 @@ new; stub; run; test $? -eq 0; test "$(grep -h '"valid": true' .claude/claudex/$
 new; stub; MODE=material run || test $? -eq 10; R=.claude/claudex/$ID/generations/1/findings-registry.json; grep -q 'CX-0001' "$R"; grep -q 'underlying_risk' "$R"; ok 'runner assigns deterministic IDs and preserves structured risk/remedy'
 new; stub; MODE=id run && exit 1 || true; test ! -e .claude/claudex/$ID/generations/1/findings-registry.json; ok 'model-provided IDs degrade without registry'
 new; stub; bash "$ROOT/scripts/start-loop.sh" plan --engine review-v3 --rounds 2 x >/dev/null 2>&1 && exit 1 || true; test ! -e .claude/claudex; ok 'one-round gate rejects before state'
-printf 'PASS: %s FAIL: 0\n' "$PASS"
+new; stub; EVIL='quotes `touch PWNED1` new
+line $(touch PWNED2) $HOME'; bash "$ROOT/scripts/start-loop.sh" plan --engine review-v3 --rounds 1 --from-draft "$EVIL" >/dev/null; test ! -e PWNED1; test ! -e PWNED2; ID=$(basename .claude/claudex/*.state .state); python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["topic"]==sys.argv[2]' ".claude/claudex/$ID/runner-config.json" "$EVIL"; ! grep -Fq "$EVIL" ".claude/claudex/$ID-runner.sh"; ok 'shell-injection topic remains inert and exact in config'
+new; stub; UTF='réview 🔒'; bash "$ROOT/scripts/start-loop.sh" plan --engine review-v3 --rounds 1 --from-draft "$UTF" >/dev/null; ID=$(basename .claude/claudex/*.state .state); python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); assert m["topic"]==sys.argv[2] and sys.argv[2].encode() in open(sys.argv[1],"rb").read()' ".claude/claudex/$ID/generations/1/manifest.json" "$UTF"; ok 'non-ASCII topic survives canonical manifest bytes'
+CONTRACT_OUTPUT=$(python3 "$ROOT/tests/review-v3-contract-test.py")
+printf '%s\n' "$CONTRACT_OUTPUT"
+CONTRACT_TOTAL=$(python3 -c 'import re,sys; print(int(re.search(r"CONTRACT PASS: ([0-9]+)",sys.argv[1]).group(1)))' "$CONTRACT_OUTPUT")
+TOTAL=$((PASS + CONTRACT_TOTAL))
+printf 'PASS: %s FAIL: 0\n' "$TOTAL"

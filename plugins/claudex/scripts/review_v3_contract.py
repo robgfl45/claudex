@@ -6,10 +6,22 @@ PERSONAS=["architecture-scope","security-data","product-domain","quality-accessi
 SEVERITIES=("high","medium","low")
 SHA_RE=re.compile(r"[0-9a-f]{64}")
 RID_RE=re.compile(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{6}")
-MAX_STRING=8000; MAX_EVIDENCE=50; MAX_FINDINGS=100; MAX_RAW_BYTES=1_000_000
+MAX_STRING=8000; MAX_EVIDENCE=50; MAX_FINDINGS=100; MAX_RAW_BYTES=2 * 1024 * 1024; MAX_JSON_DEPTH=32
 
 def canonical(obj): return json.dumps(obj,indent=2,sort_keys=True,ensure_ascii=False)+"\n"
 def sha(path): return hashlib.sha256(path.read_bytes()).hexdigest()
+def load_bounded_json(path, ceiling=MAX_RAW_BYTES):
+ size=path.stat().st_size
+ if size <= 0 or size > ceiling: raise ValueError("JSON missing, empty, or exceeds 2 MiB byte ceiling")
+ obj=json.loads(path.read_bytes().decode("utf-8"))
+ def depth(value, level=0):
+  if level > MAX_JSON_DEPTH: raise ValueError("JSON nesting exceeds depth ceiling")
+  if isinstance(value,dict):
+   for key,item in value.items(): depth(key,level+1); depth(item,level+1)
+  elif isinstance(value,list):
+   for item in value: depth(item,level+1)
+ depth(obj)
+ return obj
 def _text(value,name,allow_empty=False):
  if not isinstance(value,str) or (not allow_empty and not value.strip()) or len(value)>MAX_STRING: raise ValueError(f"{name} invalid")
  return value
@@ -29,8 +41,8 @@ def validate_raw(raw,persona,snapshot):
  return raw
 
 def load_raw(path,persona,snapshot):
- if not path.is_file() or path.stat().st_size==0 or path.stat().st_size>MAX_RAW_BYTES: raise ValueError("raw missing, empty, or oversized")
- obj=json.loads(path.read_text(encoding="utf-8")); validate_raw(obj,persona,snapshot)
+ if not path.is_file(): raise ValueError("raw missing")
+ obj=load_bounded_json(path); validate_raw(obj,persona,snapshot)
  if path.read_bytes()!=canonical(obj).encode(): raise ValueError("raw JSON is not canonical")
  return obj
 
@@ -56,6 +68,12 @@ def render(reg):
 def validate_manifest(obj,review_id,snapshot,topic,repo_root,source_plan):
  expected={"schema_version":1,"review_id":review_id,"engine":"review-v3","generation":1,"snapshot_sha256":snapshot,"required_persona_ids":PERSONAS,"topic":topic,"repo_root":repo_root,"source_plan_path":source_plan}
  if not isinstance(obj,dict) or obj!=expected: raise ValueError("manifest identity/schema mismatch")
+ return obj
+
+def load_manifest(path,review_id,snapshot,topic,repo_root,source_plan):
+ obj=load_bounded_json(path)
+ validate_manifest(obj,review_id,snapshot,topic,repo_root,source_plan)
+ if path.read_bytes()!=canonical(obj).encode("utf-8"): raise ValueError("manifest JSON is not canonical")
  return obj
 
 def validate_sidecar(obj,persona,snapshot,raw_digest,exit_code=0):

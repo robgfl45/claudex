@@ -143,7 +143,10 @@ case "$MODE" in
     if [ "$ENGINE" = "review-v3" ]; then
       [ "$CUSTOM_ROUNDS" = "1" ] || { echo "review-v3 requires --rounds 1." >&2; exit 2; }
       [ -s PLAN.md ] || { echo "review-v3 requires an existing non-empty PLAN.md." >&2; exit 2; }
-      [ -x "$CLAUDE_PLUGIN_ROOT/scripts/review-v3.py" ] || { echo "review-v3 runner is missing or not executable." >&2; exit 2; }
+      command -v python3 >/dev/null 2>&1 || { echo "review-v3 requires python3." >&2; exit 2; }
+      for helper in review-v3.py review-v3-setup.py review_v3_contract.py; do
+        [ -s "$CLAUDE_PLUGIN_ROOT/scripts/$helper" ] || { echo "review-v3 required helper is missing: $helper" >&2; exit 2; }
+      done
     fi
     ;;
   review)
@@ -415,23 +418,20 @@ if [ "$ENGINE" = "sweep-v2" ]; then
   }
 fi
 if [ "$ENGINE" = "review-v3" ]; then
-  GENERATION_DIR="$CLAUDEX_STATE_DIR/$REVIEW_ID/generations/1"
-  mkdir -p "$GENERATION_DIR" || exit 3
-  cp PLAN.md "$GENERATION_DIR/PLAN.md" || exit 3
-  chmod a-w "$GENERATION_DIR/PLAN.md" 2>/dev/null || true
-  SNAPSHOT_SHA=$(shasum -a 256 "$GENERATION_DIR/PLAN.md" | awk '{print $1}') || exit 3
-  python3 - "$GENERATION_DIR/manifest.json" "$REVIEW_ID" "$SNAPSHOT_SHA" "$TOPIC" "$REPO_ROOT" <<'PY'
-import json,pathlib,sys
-p,r,s,t,repo=sys.argv[1:]
-ids=["architecture-scope","security-data","product-domain","quality-accessibility-performance","operations-deployment"]
-pathlib.Path(p).write_text(json.dumps({"schema_version":1,"review_id":r,"engine":"review-v3","generation":1,"snapshot_sha256":s,"required_persona_ids":ids,"topic":t,"repo_root":repo,"source_plan_path":repo+"/PLAN.md"},indent=2,sort_keys=True)+"\n")
-PY
-  claudex_state_set_field "$STATE_FILE" snapshot_sha256 "$SNAPSHOT_SHA"
-  cat > "$CLAUDEX_STATE_DIR/$REVIEW_ID-runner.sh" <<EOF
-#!/usr/bin/env bash
-exec python3 "$CLAUDE_PLUGIN_ROOT/scripts/review-v3.py" --state "$STATE_FILE" --review-dir "$CLAUDEX_STATE_DIR/$REVIEW_ID" --review-id "$REVIEW_ID" --topic "$TOPIC" --repo "$REPO_ROOT" --codex "\${CLAUDEX_CODEX_BIN:-codex}" --timeout "\${CLAUDEX_SWEEP_PERSONA_TIMEOUT_SECONDS:-300}"
-EOF
-  chmod +x "$CLAUDEX_STATE_DIR/$REVIEW_ID-runner.sh"
+  if ! SNAPSHOT_SHA=$(python3 "$CLAUDE_PLUGIN_ROOT/scripts/review-v3-setup.py" \
+      --state-dir "$CLAUDEX_STATE_DIR" --plugin-root "$CLAUDE_PLUGIN_ROOT" \
+      --review-id "$REVIEW_ID" --topic "$TOPIC" --repo "$REPO_ROOT"); then
+    claudex_state_set_field "$STATE_FILE" phase errored
+    rm -f "$LOCK_FILE" "$CLAUDEX_STATE_DIR/$REVIEW_ID-runner.sh"
+    echo "Failed to create canonical review-v3 evidence/config; ownership released." >&2
+    exit 3
+  fi
+  if ! claudex_state_set_field "$STATE_FILE" snapshot_sha256 "$SNAPSHOT_SHA"; then
+    claudex_state_set_field "$STATE_FILE" phase errored
+    rm -f "$LOCK_FILE" "$CLAUDEX_STATE_DIR/$REVIEW_ID-runner.sh"
+    echo "Failed to bind review-v3 snapshot to state; ownership released." >&2
+    exit 3
+  fi
 fi
 
 # Print initial instructions to stdout. Claude will read these.
@@ -445,6 +445,15 @@ case "$MODE" in
       echo "Snapshot SHA-256: $SNAPSHOT_SHA"
       echo "Frozen snapshot: $CLAUDEX_STATE_DIR/$REVIEW_ID/generations/1/PLAN.md"
       echo "End your turn. The Stop hook will provide the deterministic sequential runner command."
+      exit 0
+    fi
+    if [ "$ENGINE" = "review-v3" ]; then
+      echo "Claudex review-v3 initialized."
+      echo "Review ID: $REVIEW_ID"
+      echo "Topic: $TOPIC"
+      echo "Snapshot SHA-256: $SNAPSHOT_SHA"
+      echo "Frozen snapshot: $CLAUDEX_STATE_DIR/$REVIEW_ID/generations/1/PLAN.md"
+      echo "End your turn. The Stop hook will provide the deterministic runner command."
       exit 0
     fi
     echo "Claudex plan mode initialized."
